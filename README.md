@@ -119,6 +119,8 @@ All **automatically**, with **clear explanations**.
 - **LLM API (OpenAI / Gemini compatible)** — Expert reasoning
 
 ---
+## Link 
+https://jzpahqig75a375i8ycpiy2.streamlit.app/
 
 ## 📦 Dependency Stability (No Version Chaos)
 
