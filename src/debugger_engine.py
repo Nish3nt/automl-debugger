@@ -1,116 +1,163 @@
-"""
-debugger_engine.py
-
-This file contains the core logic of the AutoML Debugger.
-It takes data, trains a model, diagnoses issues,
-and generates human-readable explanations.
-"""
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
-from sklearn.datasets import load_breast_cancer
-from sklearn.model_selection import train_test_split, learning_curve
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error
 
 
-def run_debugger_pipeline():
+def run_debugger_pipeline(df: pd.DataFrame, target_column: str | None):
     """
-    Main function that runs the complete debugger pipeline.
-    Returns final debugger output as a dictionary.
+    Fully robust AutoML debugger pipeline.
+    Compatible with ALL sklearn versions.
     """
 
-    # -----------------------------
-    # LOAD DATA
-    # -----------------------------
-    dataset = load_breast_cancer()
-    X = pd.DataFrame(dataset.data, columns=dataset.feature_names)
-    y = pd.Series(dataset.target, name="target")
+    df = df.copy()
 
-    # -----------------------------
-    # TRAIN-VALIDATION SPLIT
-    # -----------------------------
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y
+    # ----------------------------
+    # Safety: minimal dataset
+    # ----------------------------
+    if df.shape[0] < 5 or df.shape[1] < 2:
+        return {
+            "metrics": {},
+            "diagnosis": "Dataset too small for ML diagnostics.",
+            "llm_analysis": [
+                "The dataset does not contain enough samples or features.",
+                "Machine learning models require more data to extract patterns.",
+                "Consider collecting additional data."
+            ]
+        }
+
+    # ----------------------------
+    # Target handling
+    # ----------------------------
+    if target_column is None or target_column not in df.columns:
+        target_column = df.columns[-1]
+
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # ----------------------------
+    # Feature detection
+    # ----------------------------
+    numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    # ----------------------------
+    # Pipelines
+    # ----------------------------
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]
     )
 
-    # -----------------------------
-    # FEATURE SCALING
-    # -----------------------------
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
+    # 🔥 CRITICAL FIX: NO sparse / sparse_output ARG
+    categorical_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore"))
+        ]
+    )
 
-    # -----------------------------
-    # MODEL TRAINING
-    # -----------------------------
-    model = LogisticRegression(max_iter=1000)
-    model.fit(X_train_scaled, y_train)
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipeline, numeric_features),
+            ("cat", categorical_pipeline, categorical_features)
+        ],
+        remainder="drop"
+    )
 
-    # -----------------------------
-    # PERFORMANCE EVALUATION
-    # -----------------------------
-    train_acc = accuracy_score(y_train, model.predict(X_train_scaled))
-    val_acc = accuracy_score(y_val, model.predict(X_val_scaled))
-    acc_gap = train_acc - val_acc
-
-    if train_acc > 0.95 and acc_gap > 0.05:
-        diagnosis = "Overfitting detected"
-    elif train_acc < 0.75 and val_acc < 0.75:
-        diagnosis = "Underfitting detected"
-    else:
-        diagnosis = "Model learning looks healthy"
-
-    # -----------------------------
-    # FEATURE IMPORTANCE
-    # -----------------------------
-    feature_importance = pd.Series(
-        model.coef_[0],
-        index=X.columns
-    ).sort_values(key=abs, ascending=False)
-
-    # -----------------------------
-    # ROOT CAUSE LOGIC
-    # -----------------------------
-    root_causes = []
-    recommendations = []
-
-    if acc_gap > 0.05:
-        root_causes.append("Model generalization gap detected")
-        recommendations.append("Apply regularization or collect more data")
-
-    if feature_importance.abs().max() > 5 * feature_importance.abs().mean():
-        root_causes.append("Suspicious feature dominance")
-        recommendations.append("Check for data leakage or dominant features")
-
-    if not root_causes:
-        root_causes.append("No major issues detected")
-        recommendations.append("Model pipeline looks healthy")
-
-    # -----------------------------
-    # GENAI-STYLE EXPLANATION
-    # -----------------------------
-    explanations = []
-    for i, cause in enumerate(root_causes):
-        explanations.append(
-            f"Issue detected: {cause}. "
-            f"Recommended action: {recommendations[i]}. "
-            f"This improves model stability and reliability."
+    # ----------------------------
+    # Train-test split
+    # ----------------------------
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42
         )
+    except Exception:
+        return {
+            "metrics": {},
+            "diagnosis": "Train-test split failed due to data inconsistencies.",
+            "llm_analysis": [
+                "The dataset structure prevented proper splitting.",
+                "This often occurs with severe data corruption.",
+                "Verify column consistency and missing values."
+            ]
+        }
 
-    # -----------------------------
-    # FINAL OUTPUT
-    # -----------------------------
+    # ----------------------------
+    # Model
+    # ----------------------------
+    model = Pipeline(
+        steps=[
+            ("preprocessing", preprocessor),
+            ("regressor", LinearRegression())
+        ]
+    )
+
+    try:
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        mae = mean_absolute_error(y_test, y_pred)
+    except Exception:
+        return {
+            "metrics": {},
+            "diagnosis": "Model training failed due to incompatible data.",
+            "llm_analysis": [
+                "The target variable may not be suitable for regression.",
+                "Strong noise or non-numeric targets may exist.",
+                "Consider transforming or redefining the target."
+            ]
+        }
+
+    # ----------------------------
+    # Metrics
+    # ----------------------------
+    metrics = {
+        "r2_score": round(float(r2), 4),
+        "mae": round(float(mae), 4),
+        "rows": int(df.shape[0]),
+        "columns": int(df.shape[1]),
+        "numeric_features": len(numeric_features),
+        "categorical_features": len(categorical_features),
+        "missing_values": int(df.isna().sum().sum())
+    }
+
+    # ----------------------------
+    # Diagnosis
+    # ----------------------------
+    if r2 < 0:
+        diagnosis = "Very weak predictive signal detected."
+    elif r2 < 0.3:
+        diagnosis = "Weak predictive signal detected."
+    elif r2 < 0.6:
+        diagnosis = "Moderate predictive signal detected."
+    else:
+        diagnosis = "Strong predictive signal detected."
+
+    # ----------------------------
+    # LLM-style expert analysis
+    # ----------------------------
+    llm_analysis = [
+        f"The dataset contains {metrics['rows']} rows and {metrics['columns']} columns.",
+        f"{metrics['missing_values']} missing values were automatically handled.",
+        f"{metrics['numeric_features']} numeric features were scaled for stability.",
+        f"{metrics['categorical_features']} categorical features were encoded safely.",
+        f"R² score of {metrics['r2_score']} reflects predictive signal strength.",
+        f"MAE of {metrics['mae']} shows average prediction error.",
+        diagnosis,
+        "This analysis helps assess dataset readiness for ML modeling."
+    ]
+
     return {
-        "train_accuracy": round(train_acc, 4),
-        "validation_accuracy": round(val_acc, 4),
+        "metrics": metrics,
         "diagnosis": diagnosis,
-        "root_causes": root_causes,
-        "recommendations": recommendations,
-        "explanations": explanations
+        "llm_analysis": llm_analysis
     }
