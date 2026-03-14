@@ -60,6 +60,7 @@ df, source = load_dataset(uploaded_file)
 
 if source == "uploaded":
     st.success("Using uploaded dataset")
+
 elif source == "fallback":
     st.info("No dataset uploaded — using built-in training dataset")
 
@@ -67,25 +68,74 @@ elif source == "fallback":
 # Target column
 # ----------------------------
 target_column = None
+
 if df is not None:
     target_column = st.selectbox("🎯 Select Target Column", df.columns)
 
 # ----------------------------
-# Run debugger (ALWAYS enabled)
+# Run debugger
 # ----------------------------
 if st.button("🚀 Run AutoML Debugger"):
+
     if df is None:
-        st.info("No dataset available. Please upload a dataset or add a fallback dataset.")
+
+        st.info("No dataset available. Please upload a dataset.")
+
     else:
+
         with st.spinner("Running ML diagnostics..."):
+
             output = run_debugger_pipeline(df, target_column)
 
+        # ----------------------------
+        # Metrics
+        # ----------------------------
         st.subheader("📊 Model Metrics")
+
         if output["metrics"]:
+
             st.json(output["metrics"])
+
         else:
+
             st.info("Metrics could not be computed for this dataset.")
 
+        # ----------------------------
+        # Expert analysis
+        # ----------------------------
         st.subheader("🧠 Expert Analysis")
+
         for point in output["llm_analysis"]:
+
             st.markdown(f"- {point}")
+
+        # ----------------------------
+        # Dataset health score
+        # ----------------------------
+        st.subheader("⭐ Dataset Health Score")
+
+        score = output["metrics"].get("dataset_health_score", 0)
+
+        st.progress(score / 100)
+
+        st.write(f"Dataset Health Score: {score}/100")
+
+        # ----------------------------
+        # Feature importance
+        # ----------------------------
+        st.subheader("📊 Feature Importance")
+
+        importance = output.get("feature_importance", {})
+
+        if importance:
+
+            fi_df = pd.DataFrame({
+                "Feature": list(importance.keys()),
+                "Importance": list(importance.values())
+            })
+
+            st.bar_chart(fi_df.set_index("Feature"))
+
+        else:
+
+            st.info("Feature importance could not be computed for this dataset.")

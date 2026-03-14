@@ -10,116 +10,211 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score, mean_absolute_error
 
 
+# -----------------------------
+# LLM-style analysis
+# -----------------------------
+def generate_llm_analysis(metrics, diagnosis):
+
+    rows = metrics["rows"]
+    cols = metrics["columns"]
+    missing = metrics["missing_values"]
+    num_feat = metrics["numeric_features"]
+    cat_feat = metrics["categorical_features"]
+    r2 = metrics["r2_score"]
+    mae = metrics["mae"]
+
+    insights = []
+
+    insights.append(
+        f"The dataset contains {rows} rows and {cols} columns."
+    )
+
+    if missing > 0:
+        insights.append(
+            f"{missing} missing values were detected and automatically handled."
+        )
+    else:
+        insights.append(
+            "The dataset does not contain missing values."
+        )
+
+    insights.append(
+        f"{num_feat} numeric features were standardized for modeling stability."
+    )
+
+    if cat_feat > 0:
+        insights.append(
+            f"{cat_feat} categorical features were encoded using one-hot encoding."
+        )
+
+    if r2 > 0.8:
+        insights.append(
+            "The regression model shows strong predictive signal."
+        )
+    elif r2 > 0.5:
+        insights.append(
+            "The dataset shows moderate predictive capability."
+        )
+    else:
+        insights.append(
+            "The predictive signal appears relatively weak."
+        )
+
+    insights.append(
+        f"The Mean Absolute Error of the model is {mae}."
+    )
+
+    insights.append(diagnosis)
+
+    insights.append(
+        "Overall the dataset appears suitable for machine learning experimentation."
+    )
+
+    return insights
+
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
 def run_debugger_pipeline(df: pd.DataFrame, target_column: str | None):
-    """
-    Fully robust AutoML debugger pipeline.
-    Compatible with ALL sklearn versions.
-    """
 
     df = df.copy()
 
-    # ----------------------------
-    # Safety: minimal dataset
-    # ----------------------------
+    # dataset too small
     if df.shape[0] < 5 or df.shape[1] < 2:
         return {
             "metrics": {},
-            "diagnosis": "Dataset too small for ML diagnostics.",
-            "llm_analysis": [
-                "The dataset does not contain enough samples or features.",
-                "Machine learning models require more data to extract patterns.",
-                "Consider collecting additional data."
-            ]
+            "diagnosis": "Dataset too small.",
+            "llm_analysis": ["Dataset too small for ML diagnostics."],
+            "feature_importance": {}
         }
 
-    # ----------------------------
-    # Target handling
-    # ----------------------------
+    # target column selection
     if target_column is None or target_column not in df.columns:
         target_column = df.columns[-1]
+
+    # -----------------------------
+    # CLEAN TARGET COLUMN
+    # -----------------------------
+
+    # convert target to numeric
+    df[target_column] = pd.to_numeric(df[target_column], errors="coerce")
+
+    # drop rows where target is missing
+    df = df.dropna(subset=[target_column])
+
+    if df.shape[0] < 10:
+        return {
+            "metrics": {},
+            "diagnosis": "Not enough valid target values.",
+            "llm_analysis": [
+                "Too many missing or invalid values in the target column."
+            ],
+            "feature_importance": {}
+        }
 
     X = df.drop(columns=[target_column])
     y = df[target_column]
 
-    # ----------------------------
-    # Feature detection
-    # ----------------------------
+    # -----------------------------
+    # feature detection
+    # -----------------------------
     numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
     categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
 
-    # ----------------------------
-    # Pipelines
-    # ----------------------------
-    numeric_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler())
-        ]
+    # -----------------------------
+    # pipelines
+    # -----------------------------
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("encoder", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer([
+        ("num", numeric_pipeline, numeric_features),
+        ("cat", categorical_pipeline, categorical_features)
+    ])
+
+    # -----------------------------
+    # split
+    # -----------------------------
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.25,
+        random_state=42
     )
 
-    # 🔥 CRITICAL FIX: NO sparse / sparse_output ARG
-    categorical_pipeline = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("encoder", OneHotEncoder(handle_unknown="ignore"))
-        ]
-    )
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_pipeline, numeric_features),
-            ("cat", categorical_pipeline, categorical_features)
-        ],
-        remainder="drop"
-    )
-
-    # ----------------------------
-    # Train-test split
-    # ----------------------------
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.25, random_state=42
-        )
-    except Exception:
-        return {
-            "metrics": {},
-            "diagnosis": "Train-test split failed due to data inconsistencies.",
-            "llm_analysis": [
-                "The dataset structure prevented proper splitting.",
-                "This often occurs with severe data corruption.",
-                "Verify column consistency and missing values."
-            ]
-        }
-
-    # ----------------------------
-    # Model
-    # ----------------------------
-    model = Pipeline(
-        steps=[
-            ("preprocessing", preprocessor),
-            ("regressor", LinearRegression())
-        ]
-    )
+    # -----------------------------
+    # model
+    # -----------------------------
+    model = Pipeline([
+        ("preprocessing", preprocessor),
+        ("regressor", LinearRegression())
+    ])
 
     try:
+
         model.fit(X_train, y_train)
+
         y_pred = model.predict(X_test)
+
         r2 = r2_score(y_test, y_pred)
         mae = mean_absolute_error(y_test, y_pred)
+
     except Exception:
+
         return {
             "metrics": {},
-            "diagnosis": "Model training failed due to incompatible data.",
+            "diagnosis": "Model training failed.",
             "llm_analysis": [
-                "The target variable may not be suitable for regression.",
-                "Strong noise or non-numeric targets may exist.",
-                "Consider transforming or redefining the target."
-            ]
+                "The dataset structure prevented model training."
+            ],
+            "feature_importance": {}
         }
 
-    # ----------------------------
-    # Metrics
-    # ----------------------------
+    # -----------------------------
+    # feature importance
+    # -----------------------------
+    feature_importance = {}
+
+    try:
+
+        reg = model.named_steps["regressor"]
+
+        coef = np.abs(reg.coef_[:len(numeric_features)])
+
+        feature_importance = dict(
+            sorted(
+                zip(numeric_features, coef),
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+        )
+
+    except Exception:
+        feature_importance = {}
+
+    # -----------------------------
+    # dataset health score
+    # -----------------------------
+    missing_ratio = df.isna().sum().sum() / (df.shape[0] * df.shape[1])
+
+    score = 100 - int(missing_ratio * 40)
+
+    if r2 < 0:
+        score -= 40
+    elif r2 < 0.3:
+        score -= 25
+    elif r2 < 0.6:
+        score -= 10
+
+    score = max(score, 0)
+
     metrics = {
         "r2_score": round(float(r2), 4),
         "mae": round(float(mae), 4),
@@ -127,12 +222,11 @@ def run_debugger_pipeline(df: pd.DataFrame, target_column: str | None):
         "columns": int(df.shape[1]),
         "numeric_features": len(numeric_features),
         "categorical_features": len(categorical_features),
-        "missing_values": int(df.isna().sum().sum())
+        "missing_values": int(df.isna().sum().sum()),
+        "dataset_health_score": score
     }
 
-    # ----------------------------
-    # Diagnosis
-    # ----------------------------
+    # diagnosis
     if r2 < 0:
         diagnosis = "Very weak predictive signal detected."
     elif r2 < 0.3:
@@ -142,22 +236,11 @@ def run_debugger_pipeline(df: pd.DataFrame, target_column: str | None):
     else:
         diagnosis = "Strong predictive signal detected."
 
-    # ----------------------------
-    # LLM-style expert analysis
-    # ----------------------------
-    llm_analysis = [
-        f"The dataset contains {metrics['rows']} rows and {metrics['columns']} columns.",
-        f"{metrics['missing_values']} missing values were automatically handled.",
-        f"{metrics['numeric_features']} numeric features were scaled for stability.",
-        f"{metrics['categorical_features']} categorical features were encoded safely.",
-        f"R² score of {metrics['r2_score']} reflects predictive signal strength.",
-        f"MAE of {metrics['mae']} shows average prediction error.",
-        diagnosis,
-        "This analysis helps assess dataset readiness for ML modeling."
-    ]
+    llm_analysis = generate_llm_analysis(metrics, diagnosis)
 
     return {
         "metrics": metrics,
         "diagnosis": diagnosis,
-        "llm_analysis": llm_analysis
+        "llm_analysis": llm_analysis,
+        "feature_importance": feature_importance
     }
