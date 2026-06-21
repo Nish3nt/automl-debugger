@@ -1,27 +1,28 @@
 """
-AutoML Debugger Engine
-======================
-Production-grade ML diagnostics pipeline.
-
-Supports:
-- Auto-detection of task type (classification vs regression)
-- Real LLM-powered analysis via Anthropic Claude
-- Rich data quality profiling
-- Feature importance via tree-based models
-- Outlier, duplicate, and class imbalance detection
+AutoML Debugger Engine  (v2.0 — Industry-Ready)
+================================================
+Advancements over v1:
+  1. Groq LLM API  (replaces Anthropic)
+  2. Dataset cleaning + export
+  3. Data leakage detection
+  4. Time-series detection & safe train/test split
+  5. PDF diagnostic report export (via reportlab)
 """
 
 from __future__ import annotations
 
+import io
 import os
 import json
 import traceback
+import warnings
+from datetime import datetime
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
@@ -30,19 +31,17 @@ from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
     r2_score, mean_absolute_error, mean_squared_error,
-    accuracy_score, f1_score, roc_auc_score, classification_report
+    accuracy_score, f1_score, roc_auc_score,
 )
 
+warnings.filterwarnings("ignore")
 
-# ─────────────────────────────────────────────
-# Task auto-detection
-# ─────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# 1. TASK AUTO-DETECTION
+# ─────────────────────────────────────────────────────────────────
 
 def detect_task_type(y: pd.Series) -> str:
-    """
-    Heuristic: if target has ≤ 20 unique values and dtype is int/object → classification.
-    Otherwise → regression.
-    """
     unique_ratio = y.nunique() / len(y)
     if y.dtype == object or y.dtype.name == "category":
         return "classification"
@@ -51,26 +50,135 @@ def detect_task_type(y: pd.Series) -> str:
     return "regression"
 
 
-# ─────────────────────────────────────────────
-# Data profiler
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# ADVANCEMENT 4 — TIME-SERIES DETECTION
+# ─────────────────────────────────────────────────────────────────
+
+def detect_timeseries(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Detect whether the dataset is a time-series.
+    Returns metadata: is_timeseries, datetime_column, frequency_guess.
+    """
+    result = {
+        "is_timeseries": False,
+        "datetime_column": None,
+        "frequency_guess": None,
+        "warnings": [],
+    }
+
+    # Look for datetime-like columns
+    for col in df.columns:
+        if df[col].dtype == object:
+            try:
+                parsed = pd.to_datetime(df[col], infer_datetime_format=True)
+                # If most values parse successfully
+                if parsed.notna().mean() > 0.9:
+                    result["is_timeseries"] = True
+                    result["datetime_column"] = col
+
+                    # Guess frequency
+                    diffs = parsed.dropna().sort_values().diff().dropna()
+                    median_diff = diffs.median()
+                    days = median_diff.days if hasattr(median_diff, "days") else 0
+                    if days == 1:
+                        result["frequency_guess"] = "Daily"
+                    elif days == 7:
+                        result["frequency_guess"] = "Weekly"
+                    elif 28 <= days <= 31:
+                        result["frequency_guess"] = "Monthly"
+                    elif days == 0:
+                        result["frequency_guess"] = "Sub-daily (intraday)"
+                    else:
+                        result["frequency_guess"] = f"~{days} day intervals"
+                    break
+            except Exception:
+                continue
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            result["is_timeseries"] = True
+            result["datetime_column"] = col
+            break
+
+    if result["is_timeseries"]:
+        result["warnings"].append(
+            f"⏱️ Time-series detected (column: '{result['datetime_column']}', "
+            f"frequency: {result['frequency_guess']}). "
+            "Using chronological train/test split to prevent data leakage from the future."
+        )
+        result["warnings"].append(
+            "⚠️ Standard random train/test split is DISABLED for time-series data — "
+            "it would leak future information into training and inflate all metrics."
+        )
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# ADVANCEMENT 3 — DATA LEAKAGE DETECTION
+# ─────────────────────────────────────────────────────────────────
+
+def detect_leakage(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
+    """
+    Flag features that are suspiciously correlated with the target.
+    Correlation > 0.95 is almost always leakage in real datasets.
+    """
+    result = {
+        "leakage_candidates": [],
+        "high_correlation_features": {},
+        "warnings": [],
+    }
+
+    y = df[target_column]
+    if not pd.api.types.is_numeric_dtype(y):
+        return result  # Can't compute correlation for non-numeric targets
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_column in numeric_cols:
+        numeric_cols.remove(target_column)
+
+    for col in numeric_cols:
+        try:
+            corr = abs(df[col].corr(y))
+            if np.isnan(corr):
+                continue
+            result["high_correlation_features"][col] = round(float(corr), 4)
+            if corr > 0.95:
+                result["leakage_candidates"].append(col)
+                result["warnings"].append(
+                    f"🚨 LEAKAGE RISK: '{col}' has correlation {corr:.3f} with target — "
+                    "this feature likely contains future information or is derived from the target."
+                )
+            elif corr > 0.85:
+                result["warnings"].append(
+                    f"⚠️ High correlation: '{col}' ({corr:.3f}) — verify this isn't derived from the target."
+                )
+        except Exception:
+            continue
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# DATA PROFILER
+# ─────────────────────────────────────────────────────────────────
 
 def profile_dataset(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
-    """Compute a rich quality profile of the dataset."""
-
     X = df.drop(columns=[target_column])
     y = df[target_column]
 
-    total_cells = df.shape[0] * df.shape[1]
+    total_cells   = df.shape[0] * df.shape[1]
     missing_total = int(df.isna().sum().sum())
     missing_pct   = round(missing_total / total_cells * 100, 2)
+    missing_by_col = {
+        col: int(df[col].isna().sum())
+        for col in df.columns
+        if df[col].isna().sum() > 0
+    }
 
-    # Duplicates
     duplicate_rows = int(df.duplicated().sum())
 
-    # Outlier detection (IQR method on numeric columns)
     numeric_cols = X.select_dtypes(include=[np.number]).columns
     outlier_counts: dict[str, int] = {}
+    skewness: dict[str, float] = {}
     for col in numeric_cols:
         q1, q3 = X[col].quantile(0.25), X[col].quantile(0.75)
         iqr = q3 - q1
@@ -78,8 +186,10 @@ def profile_dataset(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
         n = int(mask.sum())
         if n > 0:
             outlier_counts[col] = n
+        sk = float(X[col].skew())
+        if not np.isnan(sk):
+            skewness[col] = round(sk, 3)
 
-    # Correlation with target (numeric features only)
     corr_with_target: dict[str, float] = {}
     if pd.api.types.is_numeric_dtype(y):
         for col in numeric_cols:
@@ -90,78 +200,179 @@ def profile_dataset(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
             sorted(corr_with_target.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
         )
 
-    # Class imbalance (classification only)
-    class_dist: dict[str, int] | None = None
+    class_dist: dict | None = None
     imbalance_ratio: float | None = None
     task_type = detect_task_type(y)
     if task_type == "classification":
         vc = y.value_counts()
-        class_dist = vc.to_dict()
+        class_dist = {str(k): int(v) for k, v in vc.items()}
         if len(vc) >= 2:
             imbalance_ratio = round(float(vc.iloc[0] / vc.iloc[-1]), 2)
 
-    # Constant / near-constant features
-    constant_features = [
-        col for col in X.columns
-        if X[col].nunique() <= 1
-    ]
-
-    # High-cardinality categoricals
+    constant_features = [col for col in X.columns if X[col].nunique() <= 1]
     cat_cols = X.select_dtypes(exclude=[np.number]).columns
-    high_card = [
-        col for col in cat_cols
-        if X[col].nunique() > 50
-    ]
+    high_card = [col for col in cat_cols if X[col].nunique() > 50]
+
+    # Column-level type warnings (NEW)
+    type_warnings: list[str] = []
+    for col in numeric_cols:
+        uniq = X[col].dropna().unique()
+        if set(uniq).issubset({0, 1, 0.0, 1.0}) and len(uniq) == 2:
+            type_warnings.append(
+                f"'{col}' has only values 0/1 but is numeric — may be a categorical flag."
+            )
+    for col in cat_cols:
+        try:
+            pd.to_datetime(X[col], infer_datetime_format=True)
+            type_warnings.append(
+                f"'{col}' looks like a date column — consider parsing it as datetime."
+            )
+        except Exception:
+            pass
+    # Detect potential ID columns
+    for col in X.columns:
+        if X[col].nunique() == len(X) and col.lower() in ["id", "index", "row_id", "uid", "uuid"]:
+            type_warnings.append(
+                f"'{col}' appears to be an ID column — should be excluded from features."
+            )
 
     return {
-        "rows":                  int(df.shape[0]),
-        "columns":               int(df.shape[1]),
-        "numeric_features":      int(len(numeric_cols)),
-        "categorical_features":  int(len(cat_cols)),
-        "missing_total":         missing_total,
-        "missing_pct":           missing_pct,
-        "duplicate_rows":        duplicate_rows,
-        "outlier_counts":        outlier_counts,
-        "top_correlations":      corr_with_target,
-        "class_distribution":    class_dist,
-        "imbalance_ratio":       imbalance_ratio,
-        "constant_features":     constant_features,
-        "high_cardinality_cols": high_card,
-        "task_type":             task_type,
+        "rows":                   int(df.shape[0]),
+        "columns":                int(df.shape[1]),
+        "numeric_features":       int(len(numeric_cols)),
+        "categorical_features":   int(len(cat_cols)),
+        "missing_total":          missing_total,
+        "missing_pct":            missing_pct,
+        "missing_by_col":         missing_by_col,
+        "duplicate_rows":         duplicate_rows,
+        "outlier_counts":         outlier_counts,
+        "skewness":               skewness,
+        "top_correlations":       corr_with_target,
+        "class_distribution":     class_dist,
+        "imbalance_ratio":        imbalance_ratio,
+        "constant_features":      constant_features,
+        "high_cardinality_cols":  high_card,
+        "type_warnings":          type_warnings,
+        "task_type":              task_type,
     }
 
 
-# ─────────────────────────────────────────────
-# Preprocessing builder
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# ADVANCEMENT 2 — DATASET CLEANING
+# ─────────────────────────────────────────────────────────────────
 
-def build_preprocessor(
-    numeric_features: list[str],
-    categorical_features: list[str],
-) -> ColumnTransformer:
+def clean_dataset(
+    df: pd.DataFrame,
+    target_column: str,
+    remove_duplicates: bool = True,
+    impute_missing: bool = True,
+    cap_outliers: bool = True,
+    drop_constant: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Clean the dataset and return (cleaned_df, cleaning_report).
+    """
+    report: dict[str, Any] = {
+        "original_shape": df.shape,
+        "actions": [],
+    }
 
+    cleaned = df.copy()
+
+    # Step 1 — Drop constant features
+    if drop_constant:
+        const_cols = [
+            col for col in cleaned.columns
+            if col != target_column and cleaned[col].nunique() <= 1
+        ]
+        if const_cols:
+            cleaned.drop(columns=const_cols, inplace=True)
+            report["actions"].append(
+                f"Dropped {len(const_cols)} constant column(s): {const_cols}"
+            )
+
+    # Step 2 — Remove duplicate rows
+    if remove_duplicates:
+        before = len(cleaned)
+        cleaned.drop_duplicates(inplace=True)
+        removed = before - len(cleaned)
+        if removed:
+            report["actions"].append(f"Removed {removed} duplicate row(s).")
+
+    # Step 3 — Impute missing values
+    if impute_missing:
+        numeric_cols = cleaned.select_dtypes(include=[np.number]).columns.tolist()
+        cat_cols     = cleaned.select_dtypes(exclude=[np.number]).columns.tolist()
+
+        filled_num = 0
+        for col in numeric_cols:
+            n = cleaned[col].isna().sum()
+            if n > 0:
+                cleaned[col].fillna(cleaned[col].median(), inplace=True)
+                filled_num += n
+
+        filled_cat = 0
+        for col in cat_cols:
+            n = cleaned[col].isna().sum()
+            if n > 0:
+                cleaned[col].fillna(cleaned[col].mode()[0], inplace=True)
+                filled_cat += n
+
+        if filled_num + filled_cat > 0:
+            report["actions"].append(
+                f"Imputed {filled_num} numeric missing values (median) "
+                f"and {filled_cat} categorical missing values (mode)."
+            )
+
+    # Step 4 — Cap outliers (IQR)
+    if cap_outliers:
+        numeric_cols = cleaned.select_dtypes(include=[np.number]).columns.tolist()
+        if target_column in numeric_cols:
+            numeric_cols.remove(target_column)
+        capped_cols = []
+        for col in numeric_cols:
+            q1 = cleaned[col].quantile(0.25)
+            q3 = cleaned[col].quantile(0.75)
+            iqr = q3 - q1
+            lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            n_outliers = ((cleaned[col] < lower) | (cleaned[col] > upper)).sum()
+            if n_outliers > 0:
+                cleaned[col] = cleaned[col].clip(lower=lower, upper=upper)
+                capped_cols.append(col)
+        if capped_cols:
+            report["actions"].append(
+                f"Capped outliers (IQR method) in {len(capped_cols)} column(s): "
+                f"{capped_cols[:5]}{'...' if len(capped_cols) > 5 else ''}"
+            )
+
+    report["final_shape"]     = cleaned.shape
+    report["rows_removed"]    = report["original_shape"][0] - cleaned.shape[0]
+    report["cols_removed"]    = report["original_shape"][1] - cleaned.shape[1]
+    report["missing_after"]   = int(cleaned.isna().sum().sum())
+
+    return cleaned, report
+
+
+# ─────────────────────────────────────────────────────────────────
+# PREPROCESSING + MODEL TRAINING
+# ─────────────────────────────────────────────────────────────────
+
+def build_preprocessor(numeric_features, categorical_features):
     numeric_pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler",  StandardScaler()),
     ])
-
     categorical_pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
         ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ])
-
-    transformers: list = []
+    transformers = []
     if numeric_features:
         transformers.append(("num", numeric_pipeline, numeric_features))
     if categorical_features:
         transformers.append(("cat", categorical_pipeline, categorical_features))
-
     return ColumnTransformer(transformers, remainder="drop")
 
-
-# ─────────────────────────────────────────────
-# Model trainer
-# ─────────────────────────────────────────────
 
 def train_and_evaluate(
     X: pd.DataFrame,
@@ -169,23 +380,26 @@ def train_and_evaluate(
     task_type: str,
     numeric_features: list[str],
     categorical_features: list[str],
-) -> dict[str, Any]:
-    """Train baseline + random forest and return rich evaluation metrics."""
-
-    # Encode target for classification
+    is_timeseries: bool = False,
+) -> tuple[dict, dict]:
     le = None
     if task_type == "classification":
         le = LabelEncoder()
         y = pd.Series(le.fit_transform(y), index=y.index, name=y.name)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42,
-        stratify=y if task_type == "classification" else None,
-    )
+    # ADVANCEMENT 4 — chronological split for time-series
+    if is_timeseries:
+        split_idx = int(len(X) * 0.8)
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42,
+            stratify=y if task_type == "classification" else None,
+        )
 
     preprocessor = build_preprocessor(numeric_features, categorical_features)
 
-    # Baseline (interpretable)
     if task_type == "regression":
         baseline_estimator = LinearRegression()
         rf_estimator       = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
@@ -193,11 +407,8 @@ def train_and_evaluate(
         baseline_estimator = LogisticRegression(max_iter=500, random_state=42)
         rf_estimator       = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
 
-    baseline_model = Pipeline([
-        ("preprocessing", preprocessor),
-        ("estimator",     baseline_estimator),
-    ])
-    rf_model = Pipeline([
+    baseline_model = Pipeline([("preprocessing", preprocessor), ("estimator", baseline_estimator)])
+    rf_model       = Pipeline([
         ("preprocessing", build_preprocessor(numeric_features, categorical_features)),
         ("estimator",     rf_estimator),
     ])
@@ -211,15 +422,18 @@ def train_and_evaluate(
     metrics: dict[str, Any] = {}
 
     if task_type == "regression":
-        metrics["r2_baseline"]   = round(float(r2_score(y_test, y_pred_base)), 4)
-        metrics["r2_rf"]         = round(float(r2_score(y_test, y_pred_rf)),   4)
-        metrics["mae"]           = round(float(mean_absolute_error(y_test, y_pred_rf)), 4)
-        metrics["rmse"]          = round(float(np.sqrt(mean_squared_error(y_test, y_pred_rf))), 4)
+        metrics["r2_baseline"] = round(float(r2_score(y_test, y_pred_base)), 4)
+        metrics["r2_rf"]       = round(float(r2_score(y_test, y_pred_rf)),   4)
+        metrics["mae"]         = round(float(mean_absolute_error(y_test, y_pred_rf)), 4)
+        metrics["rmse"]        = round(float(np.sqrt(mean_squared_error(y_test, y_pred_rf))), 4)
 
-        # Cross-validation R²
-        cv_scores = cross_val_score(rf_model, X, y, cv=5, scoring="r2")
-        metrics["cv_r2_mean"]  = round(float(cv_scores.mean()), 4)
-        metrics["cv_r2_std"]   = round(float(cv_scores.std()),  4)
+        if is_timeseries:
+            tscv = TimeSeriesSplit(n_splits=5)
+            cv_scores = cross_val_score(rf_model, X, y, cv=tscv, scoring="r2")
+        else:
+            cv_scores = cross_val_score(rf_model, X, y, cv=5, scoring="r2")
+        metrics["cv_r2_mean"] = round(float(cv_scores.mean()), 4)
+        metrics["cv_r2_std"]  = round(float(cv_scores.std()),  4)
 
     else:
         n_classes = y.nunique()
@@ -229,7 +443,6 @@ def train_and_evaluate(
         metrics["accuracy_rf"]       = round(float(accuracy_score(y_test, y_pred_rf)),   4)
         metrics["f1_score"]          = round(float(f1_score(y_test, y_pred_rf, average=avg, zero_division=0)), 4)
 
-        # AUC-ROC (binary only)
         if n_classes == 2 and hasattr(rf_model, "predict_proba"):
             try:
                 y_prob = rf_model.predict_proba(X_test)[:, 1]
@@ -237,18 +450,19 @@ def train_and_evaluate(
             except Exception:
                 pass
 
-        # Cross-validation accuracy
-        cv_scores = cross_val_score(rf_model, X, y, cv=5, scoring="accuracy")
+        if is_timeseries:
+            tscv = TimeSeriesSplit(n_splits=5)
+            cv_scores = cross_val_score(rf_model, X, y, cv=tscv, scoring="accuracy")
+        else:
+            cv_scores = cross_val_score(rf_model, X, y, cv=5, scoring="accuracy")
         metrics["cv_accuracy_mean"] = round(float(cv_scores.mean()), 4)
         metrics["cv_accuracy_std"]  = round(float(cv_scores.std()),  4)
 
-    # Feature importance from RF
+    # Feature importance
     feature_importance: dict[str, float] = {}
     try:
-        rf_step = rf_model.named_steps["estimator"]
-        prep    = rf_model.named_steps["preprocessing"]
-
-        # Get feature names after preprocessing
+        rf_step  = rf_model.named_steps["estimator"]
+        prep     = rf_model.named_steps["preprocessing"]
         all_names: list[str] = []
         for name, _, cols in prep.transformers_:
             if name == "num":
@@ -256,12 +470,9 @@ def train_and_evaluate(
             elif name == "cat":
                 enc = prep.named_transformers_["cat"].named_steps["encoder"]
                 all_names.extend(enc.get_feature_names_out(cols).tolist())
-
-        importances = rf_step.feature_importances_
         fi_pairs = sorted(
-            zip(all_names, importances),
-            key=lambda x: x[1],
-            reverse=True,
+            zip(all_names, rf_step.feature_importances_),
+            key=lambda x: x[1], reverse=True,
         )[:10]
         feature_importance = {k: round(float(v), 5) for k, v in fi_pairs}
     except Exception:
@@ -270,33 +481,21 @@ def train_and_evaluate(
     return metrics, feature_importance
 
 
-# ─────────────────────────────────────────────
-# Dataset health score
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# HEALTH SCORE
+# ─────────────────────────────────────────────────────────────────
 
 def compute_health_score(profile: dict, metrics: dict, task_type: str) -> int:
     score = 100
-
-    # Missing data penalty
-    score -= int(profile["missing_pct"] * 0.6)
-
-    # Duplicate penalty
-    dup_ratio = profile["duplicate_rows"] / max(profile["rows"], 1)
+    score -= int(profile.get("missing_pct", 0) * 0.6)
+    dup_ratio = profile.get("duplicate_rows", 0) / max(profile.get("rows", 1), 1)
     score -= int(dup_ratio * 20)
+    score -= len(profile.get("constant_features", [])) * 5
+    score -= min(len(profile.get("high_cardinality_cols", [])) * 3, 15)
+    ir = profile.get("imbalance_ratio")
+    if ir and ir > 5:    score -= 15
+    elif ir and ir > 2:  score -= 5
 
-    # Constant features penalty
-    score -= len(profile["constant_features"]) * 5
-
-    # High cardinality penalty
-    score -= min(len(profile["high_cardinality_cols"]) * 3, 15)
-
-    # Class imbalance penalty
-    if profile["imbalance_ratio"] and profile["imbalance_ratio"] > 5:
-        score -= 15
-    elif profile["imbalance_ratio"] and profile["imbalance_ratio"] > 2:
-        score -= 5
-
-    # Model performance
     if task_type == "regression":
         r2 = metrics.get("r2_rf", metrics.get("r2_baseline", 0))
         if r2 < 0:      score -= 35
@@ -304,18 +503,32 @@ def compute_health_score(profile: dict, metrics: dict, task_type: str) -> int:
         elif r2 < 0.6:  score -= 10
     else:
         acc = metrics.get("accuracy_rf", metrics.get("accuracy_baseline", 0))
-        if acc < 0.5:   score -= 35
+        if acc < 0.5:    score -= 35
         elif acc < 0.65: score -= 20
         elif acc < 0.8:  score -= 10
 
     return max(0, min(100, score))
 
 
-# ─────────────────────────────────────────────
-# LLM analysis
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# ADVANCEMENT 1 — GROQ LLM ANALYSIS
+# ─────────────────────────────────────────────────────────────────
 
-def _build_llm_prompt(profile: dict, metrics: dict, task_type: str, health_score: int) -> str:
+def _build_llm_prompt(
+    profile: dict,
+    metrics: dict,
+    task_type: str,
+    health_score: int,
+    leakage: dict,
+    ts_info: dict,
+) -> str:
+    leakage_note = ""
+    if leakage.get("leakage_candidates"):
+        leakage_note = f"\n== DATA LEAKAGE CANDIDATES ==\n{leakage['leakage_candidates']}\n"
+    ts_note = ""
+    if ts_info.get("is_timeseries"):
+        ts_note = f"\n== TIME-SERIES DETECTED ==\nDatetime column: {ts_info['datetime_column']}, Frequency: {ts_info['frequency_guess']}\n"
+
     return f"""You are a senior ML engineer reviewing an automated dataset diagnostics report.
 Analyse the results below and produce a concise expert assessment as a JSON array of bullet strings.
 
@@ -330,10 +543,10 @@ Analyse the results below and produce a concise expert assessment as a JSON arra
 
 == Dataset Health Score ==
 {health_score} / 100
-
+{leakage_note}{ts_note}
 Instructions:
 - Return ONLY a valid JSON array of 6-8 short bullet strings (no Markdown, no preamble).
-- Cover: data quality issues, model signal strength, key risks, actionable next steps.
+- Cover: data quality issues, model signal strength, leakage risks, time-series concerns (if any), actionable next steps.
 - Be direct and specific — reference actual numbers from the report.
 - Example format: ["The dataset has X rows ...", "R² of 0.72 suggests ...", ...]
 """
@@ -344,28 +557,28 @@ def generate_llm_analysis(
     metrics: dict,
     task_type: str,
     health_score: int,
+    leakage: dict,
+    ts_info: dict,
     api_key: str | None = None,
 ) -> list[str]:
-    """
-    Try Anthropic Claude first, then fall back to rule-based analysis.
-    Pass api_key=None to use os.environ['ANTHROPIC_API_KEY'] automatically.
-    """
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    """Try Groq first, then fall back to rule-based analysis."""
+    key = api_key or os.environ.get("GROQ_API_KEY", "")
 
     if key:
         try:
-            import anthropic  # pip install anthropic
-            client = anthropic.Anthropic(api_key=key)
-            prompt = _build_llm_prompt(profile, metrics, task_type, health_score)
+            from groq import Groq
+            client = Groq(api_key=key)
+            prompt = _build_llm_prompt(profile, metrics, task_type, health_score, leakage, ts_info)
 
-            message = client.messages.create(
-                model="claude-sonnet-4-5",
-                max_tokens=800,
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+                temperature=0.3,
             )
-            raw = message.content[0].text.strip()
+            raw = response.choices[0].message.content.strip()
 
-            # Strip Markdown fences if present
+            # Strip markdown fences if present
             if raw.startswith("```"):
                 raw = "\n".join(raw.split("\n")[1:-1])
 
@@ -375,7 +588,7 @@ def generate_llm_analysis(
         except Exception:
             pass  # Fall through to rule-based
 
-    return _rule_based_analysis(profile, metrics, task_type, health_score)
+    return _rule_based_analysis(profile, metrics, task_type, health_score, leakage, ts_info)
 
 
 def _rule_based_analysis(
@@ -383,174 +596,374 @@ def _rule_based_analysis(
     metrics: dict,
     task_type: str,
     health_score: int,
+    leakage: dict,
+    ts_info: dict,
 ) -> list[str]:
     insights: list[str] = []
 
-    # Size
     insights.append(
-        f"Dataset contains {profile['rows']:,} rows × {profile['columns']} columns "
-        f"({profile['numeric_features']} numeric, {profile['categorical_features']} categorical features)."
+        f"Dataset contains {profile.get('rows', 0):,} rows × {profile.get('columns', 0)} columns "
+        f"({profile.get('numeric_features', 0)} numeric, {profile.get('categorical_features', 0)} categorical)."
     )
 
+    # Time-series
+    if ts_info.get("is_timeseries"):
+        insights.append(
+            f"⏱️ Time-series dataset detected ('{ts_info['datetime_column']}', {ts_info['frequency_guess']}). "
+            "Chronological split used — future leakage prevented."
+        )
+
+    # Leakage
+    if leakage.get("leakage_candidates"):
+        insights.append(
+            f"🚨 {len(leakage['leakage_candidates'])} potential data leakage feature(s) found: "
+            f"{leakage['leakage_candidates']} — correlation > 0.95 with target. Verify before deploying."
+        )
+
     # Missing values
-    if profile["missing_pct"] > 10:
-        insights.append(
-            f"⚠️ High missing-value rate: {profile['missing_pct']}% of all cells — imputation or removal needed."
-        )
-    elif profile["missing_total"] > 0:
-        insights.append(
-            f"Minor missing data ({profile['missing_pct']}%) — median/mode imputation applied automatically."
-        )
+    if profile.get("missing_pct", 0) > 10:
+        insights.append(f"⚠️ High missing-value rate: {profile['missing_pct']}% — imputation or removal needed.")
+    elif profile.get("missing_total", 0) > 0:
+        insights.append(f"Minor missing data ({profile['missing_pct']}%) — median/mode imputation applied.")
     else:
-        insights.append("No missing values detected — clean feature matrix for modeling.")
+        insights.append("✅ No missing values — clean feature matrix.")
 
     # Duplicates
-    if profile["duplicate_rows"] > 0:
-        insights.append(
-            f"⚠️ {profile['duplicate_rows']} duplicate rows found — these should be removed before training."
-        )
+    if profile.get("duplicate_rows", 0) > 0:
+        insights.append(f"⚠️ {profile['duplicate_rows']} duplicate rows — remove before training.")
 
     # Outliers
-    if profile["outlier_counts"]:
+    if profile.get("outlier_counts"):
         top_col = max(profile["outlier_counts"], key=profile["outlier_counts"].get)
         insights.append(
-            f"Outliers detected in {len(profile['outlier_counts'])} features "
-            f"(worst: '{top_col}' with {profile['outlier_counts'][top_col]} outliers) — "
-            f"consider robust scaling or capping."
+            f"Outliers in {len(profile['outlier_counts'])} features "
+            f"(worst: '{top_col}' with {profile['outlier_counts'][top_col]}) — consider IQR capping."
         )
 
     # Class imbalance
-    if profile["imbalance_ratio"] and profile["imbalance_ratio"] > 3:
+    if profile.get("imbalance_ratio") and profile["imbalance_ratio"] > 3:
         insights.append(
-            f"⚠️ Class imbalance ratio {profile['imbalance_ratio']}:1 — "
-            f"use SMOTE, class_weight='balanced', or collect more minority samples."
+            f"⚠️ Class imbalance {profile['imbalance_ratio']}:1 — use SMOTE or class_weight='balanced'."
         )
 
     # Model signal
     if task_type == "regression":
-        r2 = metrics.get("r2_rf", metrics.get("r2_baseline", 0))
+        r2  = metrics.get("r2_rf", metrics.get("r2_baseline", 0))
         mae = metrics.get("mae", "N/A")
         cv  = metrics.get("cv_r2_mean", "N/A")
         if r2 >= 0.8:
-            insights.append(
-                f"✅ Strong predictive signal: RF R²={r2}, MAE={mae}, CV-R²={cv} — ready for advanced modeling."
-            )
+            insights.append(f"✅ Strong signal: RF R²={r2}, MAE={mae}, CV-R²={cv} — ready for advanced modeling.")
         elif r2 >= 0.5:
-            insights.append(
-                f"Moderate signal: RF R²={r2}, MAE={mae} — feature engineering or more data may boost performance."
-            )
+            insights.append(f"Moderate signal: RF R²={r2}, MAE={mae} — feature engineering may help.")
         else:
-            insights.append(
-                f"⚠️ Weak signal: RF R²={r2}, MAE={mae} — reconsider target definition or gather stronger features."
-            )
+            insights.append(f"⚠️ Weak signal: RF R²={r2} — reconsider target or add stronger features.")
     else:
         acc = metrics.get("accuracy_rf", metrics.get("accuracy_baseline", 0))
         f1  = metrics.get("f1_score", "N/A")
         auc = metrics.get("roc_auc", "N/A")
-        cv  = metrics.get("cv_accuracy_mean", "N/A")
         if acc >= 0.85:
-            insights.append(
-                f"✅ Strong classification signal: Accuracy={acc}, F1={f1}, AUC={auc}, CV={cv}."
-            )
+            insights.append(f"✅ Strong classification: Accuracy={acc}, F1={f1}, AUC={auc}.")
         elif acc >= 0.65:
-            insights.append(
-                f"Moderate accuracy: {acc} (F1={f1}) — try ensemble methods or better feature selection."
-            )
+            insights.append(f"Moderate accuracy: {acc} (F1={f1}) — try ensemble methods.")
         else:
-            insights.append(
-                f"⚠️ Poor accuracy ({acc}) — check for label noise, class imbalance, or insufficient features."
-            )
+            insights.append(f"⚠️ Poor accuracy ({acc}) — check label noise or class imbalance.")
 
-    # Constant features
-    if profile["constant_features"]:
-        insights.append(
-            f"⚠️ {len(profile['constant_features'])} constant feature(s) found "
-            f"({', '.join(profile['constant_features'][:3])}) — drop them before training."
-        )
-
-    # High cardinality
-    if profile["high_cardinality_cols"]:
-        insights.append(
-            f"High-cardinality categorical columns detected: {profile['high_cardinality_cols']} — "
-            f"consider target encoding or frequency encoding instead of one-hot."
-        )
-
-    # Health score verdict
+    # Health verdict
     if health_score >= 80:
-        insights.append(f"✅ Overall health score: {health_score}/100 — dataset is production-ready.")
+        insights.append(f"✅ Health score: {health_score}/100 — dataset is production-ready.")
     elif health_score >= 60:
-        insights.append(f"Dataset health score: {health_score}/100 — usable with minor remediation.")
+        insights.append(f"Health score: {health_score}/100 — usable with minor remediation.")
     else:
-        insights.append(f"⚠️ Low health score: {health_score}/100 — significant data quality work required.")
+        insights.append(f"⚠️ Health score: {health_score}/100 — significant data quality work required.")
 
     return insights
 
 
-# ─────────────────────────────────────────────
-# Main pipeline entry point
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# ADVANCEMENT 5 — PDF REPORT GENERATION
+# ─────────────────────────────────────────────────────────────────
+
+def generate_pdf_report(
+    profile: dict,
+    metrics: dict,
+    task_type: str,
+    health_score: int,
+    diagnosis: str,
+    llm_analysis: list[str],
+    feature_importance: dict,
+    leakage: dict,
+    ts_info: dict,
+    cleaning_report: dict | None = None,
+) -> bytes:
+    """Generate a PDF diagnostic report and return as bytes."""
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+        )
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer, pagesize=A4,
+            leftMargin=2*cm, rightMargin=2*cm,
+            topMargin=2*cm, bottomMargin=2*cm,
+        )
+
+        styles = getSampleStyleSheet()
+        style_title   = ParagraphStyle("Title",   fontSize=22, fontName="Helvetica-Bold",  textColor=colors.HexColor("#1a1f35"), spaceAfter=6)
+        style_h2      = ParagraphStyle("H2",      fontSize=14, fontName="Helvetica-Bold",  textColor=colors.HexColor("#2e3555"), spaceBefore=14, spaceAfter=4)
+        style_body    = ParagraphStyle("Body",    fontSize=10, fontName="Helvetica",       leading=14, spaceAfter=4)
+        style_bullet  = ParagraphStyle("Bullet",  fontSize=10, fontName="Helvetica",       leading=14, leftIndent=12, spaceAfter=3)
+        style_caption = ParagraphStyle("Caption", fontSize=8,  fontName="Helvetica-Oblique", textColor=colors.grey)
+
+        BLUE   = colors.HexColor("#7eb6ff")
+        DARK   = colors.HexColor("#1a1f35")
+        GREEN  = colors.HexColor("#5dbc8a")
+        RED    = colors.HexColor("#e07070")
+        AMBER  = colors.HexColor("#e0b070")
+
+        story = []
+
+        # Header
+        story.append(Paragraph("🧠 AutoML Debugger — Diagnostic Report", style_title))
+        story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", style_caption))
+        story.append(HRFlowable(width="100%", thickness=1, color=BLUE, spaceAfter=12))
+
+        # Health Score
+        story.append(Paragraph("Dataset Health Score", style_h2))
+        hs_color = GREEN if health_score >= 80 else (AMBER if health_score >= 60 else RED)
+        verdict  = "Production-Ready" if health_score >= 80 else ("Needs Minor Work" if health_score >= 60 else "Significant Issues")
+        story.append(Paragraph(f"<font color='#{hs_color.hexval()[2:]}' size='18'><b>{health_score} / 100</b></font> — {verdict}", style_body))
+        story.append(Paragraph(f"<b>Diagnosis:</b> {diagnosis}", style_body))
+        story.append(Spacer(1, 8))
+
+        # Dataset Profile
+        story.append(Paragraph("Dataset Profile", style_h2))
+        profile_data = [
+            ["Metric", "Value"],
+            ["Rows",              f"{profile.get('rows', 0):,}"],
+            ["Columns",           str(profile.get('columns', 0))],
+            ["Numeric Features",  str(profile.get('numeric_features', 0))],
+            ["Categorical Features", str(profile.get('categorical_features', 0))],
+            ["Missing Values",    f"{profile.get('missing_total', 0)} ({profile.get('missing_pct', 0)}%)"],
+            ["Duplicate Rows",    str(profile.get('duplicate_rows', 0))],
+            ["Task Type",         task_type.capitalize()],
+            ["Constant Features", str(len(profile.get('constant_features', [])))],
+            ["High-Cardinality Cols", str(len(profile.get('high_cardinality_cols', [])))],
+        ]
+        t = Table(profile_data, colWidths=[8*cm, 8*cm])
+        t.setStyle(TableStyle([
+            ("BACKGROUND",  (0,0), (-1,0), DARK),
+            ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
+            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",    (0,0), (-1,-1), 9),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f7ff")]),
+            ("GRID",        (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+            ("PADDING",     (0,0), (-1,-1), 6),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 10))
+
+        # Time-series info
+        if ts_info.get("is_timeseries"):
+            story.append(Paragraph("⏱️ Time-Series Detected", style_h2))
+            story.append(Paragraph(
+                f"DateTime column: <b>{ts_info['datetime_column']}</b> | "
+                f"Frequency: <b>{ts_info['frequency_guess']}</b>. "
+                "Chronological train/test split was applied to prevent future data leakage.",
+                style_body
+            ))
+            story.append(Spacer(1, 6))
+
+        # Data leakage
+        if leakage.get("leakage_candidates"):
+            story.append(Paragraph("🚨 Data Leakage Risks", style_h2))
+            for w in leakage.get("warnings", []):
+                story.append(Paragraph(f"• {w}", style_bullet))
+            story.append(Spacer(1, 6))
+
+        # Model Metrics
+        story.append(Paragraph("Model Performance Metrics", style_h2))
+        if task_type == "regression":
+            metric_data = [
+                ["Metric", "Value"],
+                ["R² (Baseline)",  str(metrics.get("r2_baseline", "—"))],
+                ["R² (Random Forest)", str(metrics.get("r2_rf", "—"))],
+                ["MAE",            str(metrics.get("mae", "—"))],
+                ["RMSE",           str(metrics.get("rmse", "—"))],
+                ["CV R² Mean",     str(metrics.get("cv_r2_mean", "—"))],
+                ["CV R² Std",      str(metrics.get("cv_r2_std", "—"))],
+            ]
+        else:
+            metric_data = [
+                ["Metric", "Value"],
+                ["Accuracy (Baseline)", str(metrics.get("accuracy_baseline", "—"))],
+                ["Accuracy (RF)",       str(metrics.get("accuracy_rf", "—"))],
+                ["F1 Score",            str(metrics.get("f1_score", "—"))],
+                ["ROC-AUC",             str(metrics.get("roc_auc", "—"))],
+                ["CV Accuracy Mean",    str(metrics.get("cv_accuracy_mean", "—"))],
+                ["CV Accuracy Std",     str(metrics.get("cv_accuracy_std", "—"))],
+            ]
+        mt = Table(metric_data, colWidths=[8*cm, 8*cm])
+        mt.setStyle(TableStyle([
+            ("BACKGROUND",  (0,0), (-1,0), DARK),
+            ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
+            ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",    (0,0), (-1,-1), 9),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f7ff")]),
+            ("GRID",        (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+            ("PADDING",     (0,0), (-1,-1), 6),
+        ]))
+        story.append(mt)
+        story.append(Spacer(1, 10))
+
+        # Expert Analysis
+        story.append(Paragraph("Expert Analysis (AI-Generated)", style_h2))
+        for bullet in llm_analysis:
+            story.append(Paragraph(f"• {bullet}", style_bullet))
+        story.append(Spacer(1, 10))
+
+        # Feature Importance
+        if feature_importance:
+            story.append(Paragraph("Top Feature Importance (Random Forest)", style_h2))
+            fi_data = [["Feature", "Importance"]] + [
+                [k, f"{v:.5f}"] for k, v in list(feature_importance.items())[:8]
+            ]
+            fi_table = Table(fi_data, colWidths=[10*cm, 6*cm])
+            fi_table.setStyle(TableStyle([
+                ("BACKGROUND",  (0,0), (-1,0), DARK),
+                ("TEXTCOLOR",   (0,0), (-1,0), colors.white),
+                ("FONTNAME",    (0,0), (-1,0), "Helvetica-Bold"),
+                ("FONTSIZE",    (0,0), (-1,-1), 9),
+                ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#f5f7ff")]),
+                ("GRID",        (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+                ("PADDING",     (0,0), (-1,-1), 6),
+            ]))
+            story.append(fi_table)
+            story.append(Spacer(1, 10))
+
+        # Cleaning report
+        if cleaning_report:
+            story.append(Paragraph("Dataset Cleaning Summary", style_h2))
+            orig = cleaning_report.get("original_shape", ("?", "?"))
+            final = cleaning_report.get("final_shape", ("?", "?"))
+            story.append(Paragraph(
+                f"Original shape: <b>{orig[0]} × {orig[1]}</b> → "
+                f"Cleaned shape: <b>{final[0]} × {final[1]}</b>",
+                style_body
+            ))
+            for action in cleaning_report.get("actions", []):
+                story.append(Paragraph(f"• {action}", style_bullet))
+            story.append(Spacer(1, 6))
+
+        # Footer
+        story.append(HRFlowable(width="100%", thickness=1, color=BLUE, spaceBefore=12))
+        story.append(Paragraph(
+            "AutoML Debugger v2.0 · Powered by Groq LLaMA 3.3 70B · Built with scikit-learn & Streamlit",
+            style_caption
+        ))
+
+        doc.build(story)
+        return buffer.getvalue()
+
+    except ImportError:
+        # If reportlab not installed, return a plain-text fallback as bytes
+        lines = [
+            "AUTOML DEBUGGER — DIAGNOSTIC REPORT",
+            "=" * 50,
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Health Score: {health_score}/100",
+            f"Task Type: {task_type}",
+            f"Diagnosis: {diagnosis}",
+            "",
+            "METRICS:",
+            json.dumps(metrics, indent=2),
+            "",
+            "EXPERT ANALYSIS:",
+        ] + [f"• {b}" for b in llm_analysis]
+        return "\n".join(lines).encode("utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN PIPELINE ENTRY POINT
+# ─────────────────────────────────────────────────────────────────
 
 def run_debugger_pipeline(
     df: pd.DataFrame,
     target_column: str | None = None,
     api_key: str | None = None,
+    run_cleaning: bool = False,
+    cleaning_options: dict | None = None,
 ) -> dict[str, Any]:
     """
-    Full AutoML diagnostics pipeline.
+    Full AutoML diagnostics pipeline (v2.0).
 
     Parameters
     ----------
-    df            : Input DataFrame
-    target_column : Name of the label column (auto-detected if None)
-    api_key       : Anthropic API key (uses env var if None)
+    df               : Input DataFrame
+    target_column    : Label column (auto-detected if None)
+    api_key          : Groq API key (uses GROQ_API_KEY env var if None)
+    run_cleaning     : Whether to run and return a cleaned dataset
+    cleaning_options : Dict of cleaning flags (see clean_dataset)
 
     Returns
     -------
-    dict with keys: metrics, diagnosis, llm_analysis, feature_importance,
-                    profile, task_type, health_score
+    dict with keys:
+        metrics, diagnosis, llm_analysis, feature_importance,
+        profile, task_type, health_score,
+        leakage, ts_info,
+        cleaned_df (if run_cleaning=True), cleaning_report,
+        pdf_bytes
     """
     df = df.copy()
 
-    # Minimum size check
     if df.shape[0] < 10 or df.shape[1] < 2:
         return {
-            "metrics":           {},
-            "diagnosis":         "Dataset too small.",
-            "llm_analysis":      ["Dataset is too small for reliable ML diagnostics (need ≥ 10 rows, ≥ 2 columns)."],
-            "feature_importance": {},
-            "profile":           {},
-            "task_type":         "unknown",
-            "health_score":      0,
+            "metrics": {}, "diagnosis": "Dataset too small.",
+            "llm_analysis": ["Dataset is too small for reliable ML diagnostics (need ≥ 10 rows, ≥ 2 columns)."],
+            "feature_importance": {}, "profile": {}, "task_type": "unknown",
+            "health_score": 0, "leakage": {}, "ts_info": {},
+            "cleaned_df": None, "cleaning_report": {}, "pdf_bytes": None,
         }
 
-    # Target column resolution
+    # Target resolution
     if target_column is None or target_column not in df.columns:
         target_column = df.columns[-1]
 
-    # Coerce target for regression, clean for classification
-    task_hint = detect_task_type(df[target_column])
-    if task_hint == "regression":
-        df[target_column] = pd.to_numeric(df[target_column], errors="coerce")
-    df = df.dropna(subset=[target_column])
+    # ADVANCEMENT 4 — Time-series detection (before any splitting)
+    ts_info = detect_timeseries(df)
 
-    if df.shape[0] < 10:
+    # Drop the datetime column from features if detected
+    df_model = df.copy()
+    if ts_info["is_timeseries"] and ts_info["datetime_column"]:
+        dt_col = ts_info["datetime_column"]
+        if dt_col != target_column and dt_col in df_model.columns:
+            df_model = df_model.drop(columns=[dt_col])
+
+    # Coerce target
+    task_hint = detect_task_type(df_model[target_column])
+    if task_hint == "regression":
+        df_model[target_column] = pd.to_numeric(df_model[target_column], errors="coerce")
+    df_model = df_model.dropna(subset=[target_column])
+
+    if df_model.shape[0] < 10:
         return {
-            "metrics":           {},
-            "diagnosis":         "Not enough valid target values after cleaning.",
-            "llm_analysis":      ["Too many missing/invalid values in the target column — cannot train."],
-            "feature_importance": {},
-            "profile":           {},
-            "task_type":         task_hint,
-            "health_score":      0,
+            "metrics": {}, "diagnosis": "Not enough valid target values after cleaning.",
+            "llm_analysis": ["Too many missing/invalid values in the target column."],
+            "feature_importance": {}, "profile": {}, "task_type": task_hint,
+            "health_score": 0, "leakage": {}, "ts_info": ts_info,
+            "cleaned_df": None, "cleaning_report": {}, "pdf_bytes": None,
         }
 
-    # Drop constant columns silently (they break pipelines)
-    non_const = [c for c in df.columns if df[c].nunique() > 1 or c == target_column]
-    df = df[non_const]
+    # Drop constant columns
+    non_const = [c for c in df_model.columns if df_model[c].nunique() > 1 or c == target_column]
+    df_model = df_model[non_const]
 
-    X = df.drop(columns=[target_column])
-    y = df[target_column]
-
+    X = df_model.drop(columns=[target_column])
+    y = df_model[target_column]
     task_type = detect_task_type(y)
 
     numeric_features     = X.select_dtypes(include=[np.number]).columns.tolist()
@@ -558,53 +971,76 @@ def run_debugger_pipeline(
 
     # Profile
     try:
-        profile = profile_dataset(df, target_column)
+        profile = profile_dataset(df_model, target_column)
     except Exception:
-        profile = {"rows": df.shape[0], "columns": df.shape[1]}
+        profile = {"rows": df_model.shape[0], "columns": df_model.shape[1]}
+
+    # ADVANCEMENT 3 — Leakage detection
+    leakage = detect_leakage(df_model, target_column)
 
     # Train & evaluate
     try:
         metrics, feature_importance = train_and_evaluate(
-            X, y, task_type, numeric_features, categorical_features
+            X, y, task_type, numeric_features, categorical_features,
+            is_timeseries=ts_info["is_timeseries"],
         )
     except Exception as e:
         return {
-            "metrics":            {},
-            "diagnosis":          f"Model training failed: {e}",
-            "llm_analysis":       [f"Training error: {traceback.format_exc(limit=2)}"],
-            "feature_importance": {},
-            "profile":            profile,
-            "task_type":          task_type,
-            "health_score":       0,
+            "metrics": {}, "diagnosis": f"Model training failed: {e}",
+            "llm_analysis": [f"Training error: {traceback.format_exc(limit=2)}"],
+            "feature_importance": {}, "profile": profile, "task_type": task_type,
+            "health_score": 0, "leakage": leakage, "ts_info": ts_info,
+            "cleaned_df": None, "cleaning_report": {}, "pdf_bytes": None,
         }
 
-    # Add profile metadata into metrics for display
-    metrics["rows"]                = profile["rows"]
-    metrics["columns"]             = profile["columns"]
-    metrics["numeric_features"]    = profile["numeric_features"]
-    metrics["categorical_features"]= profile["categorical_features"]
-    metrics["missing_values"]      = profile["missing_total"]
+    # Merge profile metadata into metrics
+    metrics.update({
+        "rows": profile["rows"], "columns": profile["columns"],
+        "numeric_features": profile["numeric_features"],
+        "categorical_features": profile["categorical_features"],
+        "missing_values": profile["missing_total"],
+    })
 
-    # Health score
     health_score = compute_health_score(profile, metrics, task_type)
     metrics["dataset_health_score"] = health_score
 
     # Diagnosis string
     if task_type == "regression":
         r2 = metrics.get("r2_rf", 0)
-        if r2 >= 0.8:    diagnosis = "Strong predictive signal detected — dataset is ML-ready."
-        elif r2 >= 0.5:  diagnosis = "Moderate predictive signal — feature engineering recommended."
-        elif r2 >= 0.0:  diagnosis = "Weak predictive signal — consider better features or more data."
+        if r2 >= 0.8:    diagnosis = "Strong predictive signal — dataset is ML-ready."
+        elif r2 >= 0.5:  diagnosis = "Moderate signal — feature engineering recommended."
+        elif r2 >= 0.0:  diagnosis = "Weak signal — consider better features or more data."
         else:            diagnosis = "Very weak signal (negative R²) — major data quality issues."
     else:
         acc = metrics.get("accuracy_rf", 0)
-        if acc >= 0.85:  diagnosis = "Strong classification performance — dataset is ML-ready."
+        if acc >= 0.85:   diagnosis = "Strong classification performance — dataset is ML-ready."
         elif acc >= 0.65: diagnosis = "Moderate accuracy — further tuning needed."
-        else:            diagnosis = "Low accuracy — review labels, features, and class balance."
+        else:             diagnosis = "Low accuracy — review labels, features, and class balance."
 
     # LLM analysis
     llm_analysis = generate_llm_analysis(
-        profile, metrics, task_type, health_score, api_key=api_key
+        profile, metrics, task_type, health_score,
+        leakage, ts_info, api_key=api_key,
+    )
+
+    # ADVANCEMENT 2 — Dataset cleaning
+    cleaned_df     = None
+    cleaning_report = {}
+    if run_cleaning:
+        opts = cleaning_options or {}
+        cleaned_df, cleaning_report = clean_dataset(
+            df,  # clean the original df (with datetime col)
+            target_column,
+            remove_duplicates=opts.get("remove_duplicates", True),
+            impute_missing=opts.get("impute_missing", True),
+            cap_outliers=opts.get("cap_outliers", True),
+            drop_constant=opts.get("drop_constant", True),
+        )
+
+    # ADVANCEMENT 5 — PDF report
+    pdf_bytes = generate_pdf_report(
+        profile, metrics, task_type, health_score, diagnosis,
+        llm_analysis, feature_importance, leakage, ts_info, cleaning_report or None,
     )
 
     return {
@@ -615,4 +1051,9 @@ def run_debugger_pipeline(
         "profile":            profile,
         "task_type":          task_type,
         "health_score":       health_score,
+        "leakage":            leakage,
+        "ts_info":            ts_info,
+        "cleaned_df":         cleaned_df,
+        "cleaning_report":    cleaning_report,
+        "pdf_bytes":          pdf_bytes,
     }
