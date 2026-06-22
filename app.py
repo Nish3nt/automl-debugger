@@ -557,12 +557,8 @@ elif cur == 2:
     cf = model_results.get("categorical_features", [])
 
     if bp and task != "clustering":
-        log("🔮 Computing SHAP values...")
-        try:
-            X_shap = cleaned_df.drop(columns=[target]).head(200)
-            S["shap_data"] = compute_shap_values(bp, X_shap, nf, cf)
-        except Exception:
-            S["shap_data"] = {"available": False}
+        # SHAP is computed on-demand in the Results tab (too slow for training)
+        S["shap_data"] = {}
 
         Xt = model_results.get("X_test")
         yt = model_results.get("y_test")
@@ -814,29 +810,48 @@ elif cur == 3:
 
     # ── SHAP ─────────────────────────────────
     with tabs[3]:
-        shap_d = S.get("shap_data",{})
-        if not shap_d.get("available"):
-            st.warning(shap_d.get("error","SHAP not available."))
-        else:
-            gi = shap_d.get("global_importance",{})
+        shap_d = S.get("shap_data", {})
+
+        # Lazy compute — only runs when user clicks this tab
+        if not shap_d.get("available") and not shap_d.get("tried"):
+            if st.button("🔮 Compute SHAP Explanations", type="primary"):
+                bp_s = S["model_results"].get("best_pipeline")
+                nf_s = S["model_results"].get("numeric_features", [])
+                cf_s = S["model_results"].get("categorical_features", [])
+                tgt  = S["target_column"]
+                with st.spinner("Computing SHAP values (50 samples)..."):
+                    try:
+                        X_shap = S["cleaned_df"].drop(columns=[tgt]).head(50)
+                        result_shap = compute_shap_values(bp_s, X_shap, nf_s, cf_s, max_samples=50)
+                        result_shap["tried"] = True
+                        S["shap_data"] = result_shap
+                        st.rerun()
+                    except Exception as e:
+                        S["shap_data"] = {"available": False, "tried": True, "error": str(e)}
+                        st.rerun()
+            st.caption("SHAP runs on demand — click above to generate explanations.")
+        elif shap_d.get("available"):
+            gi = shap_d.get("global_importance", {})
             if gi:
-                gi_df = pd.DataFrame({"Feature":list(gi.keys()),"Mean |SHAP|":list(gi.values())}).sort_values("Mean |SHAP|",ascending=True)
+                gi_df = pd.DataFrame({"Feature": list(gi.keys()), "Mean |SHAP|": list(gi.values())}).sort_values("Mean |SHAP|", ascending=True)
                 fig = px.bar(gi_df, x="Mean |SHAP|", y="Feature", orientation="h",
                              color="Mean |SHAP|", color_continuous_scale="Blues", template="plotly_dark")
                 fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#141920",
                                   coloraxis_showscale=False, margin=dict(t=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-            for s in shap_d.get("sample_explanations",[]):
+            for s in shap_d.get("sample_explanations", []):
                 with st.expander(f"Row {s['row']+1} — prediction drivers"):
                     for feat in s["top_features"]:
-                        c = "#5dbc8a" if feat["shap"]>0 else "#e07070"
-                        d = "▲ pushed UP" if feat["shap"]>0 else "▼ pushed DOWN"
+                        c = "#5dbc8a" if feat["shap"] > 0 else "#e07070"
+                        d = "▲ pushed UP" if feat["shap"] > 0 else "▼ pushed DOWN"
                         st.markdown(
                             f'<div class="card" style="padding:7px 12px;border-left:3px solid {c};margin-bottom:4px;font-size:0.85rem">'
                             f'<b>{feat["feature"]}</b> — SHAP {feat["shap"]:+.4f} — <span style="color:{c}">{d}</span></div>',
                             unsafe_allow_html=True,
                         )
+        else:
+            st.warning(shap_d.get("error", "SHAP computation failed."))
 
     # ── Evaluation ───────────────────────────
     with tabs[4]:
