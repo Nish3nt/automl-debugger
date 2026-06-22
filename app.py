@@ -210,18 +210,26 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:#1e2535;margin:10px 0'>", unsafe_allow_html=True)
 
-    # API Key
-    saved_key = S["api_key"]
-    if not saved_key:
-        if hasattr(st, "secrets"):
-            saved_key = st.secrets.get("GROQ_API_KEY", "")
-        if not saved_key:
-            saved_key = os.environ.get("GROQ_API_KEY", "")
+    # API Key — read from secrets/env silently, allow user to override
+    env_key = ""
+    if hasattr(st, "secrets"):
+        env_key = st.secrets.get("GROQ_API_KEY", "")
+    if not env_key:
+        env_key = os.environ.get("GROQ_API_KEY", "")
 
-    api_key = st.text_input("🔑 Groq API Key", type="password",
-                             value=saved_key, label_visibility="visible",
-                             placeholder="gsk_...")
-    S["api_key"] = api_key
+    # Only show input if no key found in environment
+    if env_key:
+        S["api_key"] = env_key
+        st.markdown(
+            "<div style='font-size:0.78rem;color:#2a5c3a;background:#111a14;"
+            "border:1px solid #2a5c3a;border-radius:6px;padding:7px 10px;margin-bottom:4px'>"
+            "🔑 Groq API Key ✅ Connected</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        api_key = st.text_input("🔑 Groq API Key", type="password",
+                                 placeholder="gsk_...", label_visibility="visible")
+        S["api_key"] = api_key
 
     st.markdown("<div style='font-size:0.72rem;color:#3a4255;margin-top:-8px;margin-bottom:10px'>Optional — enables LLM analysis</div>", unsafe_allow_html=True)
 
