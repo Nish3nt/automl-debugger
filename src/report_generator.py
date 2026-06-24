@@ -329,6 +329,7 @@ def generate_pdf(
         story.append(Spacer(1, 1.5*cm))
         story.append(Paragraph("AutoML Debugger", s_cover_sub))
         story.append(Paragraph("ML Dataset Audit Report", s_cover_title))
+        story.append(Spacer(1, 0.3*cm))
         story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=14))
 
         grade    = scorecard.get("overall_grade", "?")
@@ -357,12 +358,19 @@ def generate_pdf(
         story.append(mt)
         story.append(Spacer(1, 0.5*cm))
 
-        # Grade badge
+        # Grade badge - no em-dash to avoid ReportLab rendering issues
+        verdict_text = scorecard.get("overall_verdict", "").replace("—", "-")
+        gc_hex = gc.hexval()[2:]
         story.append(Paragraph(
-            f'<font size="14" color="#{gc.hexval()[2:]}"><b>Data Quality Grade: {grade} — {scorecard.get("overall_verdict","")}</b></font>',
+            f'<font size="13" color="#{gc_hex}"><b>Data Quality Grade: {grade}</b></font>',
+            s_body,
+        ))
+        story.append(Paragraph(
+            f'<font size="11" color="#{gc_hex}">{verdict_text}</font>',
             s_body,
         ))
         story.append(Paragraph(scorecard.get("benchmark", ""), s_caption))
+        story.append(Spacer(1, 0.8*cm))
         story.append(PageBreak())
 
         # ── SCORECARD TABLE ───────────────────────────────────────
