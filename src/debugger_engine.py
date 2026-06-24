@@ -832,3 +832,465 @@ def detect_leakage(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
         except Exception:
             continue
     return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 2 — FEATURE 9
+# TARGET LEAKAGE PROBABILITY SCORE (Mutual Information)
+# ─────────────────────────────────────────────────────────────────
+
+def compute_leakage_probability(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
+    """
+    Uses mutual information (MI) alongside correlation to give a
+    leakage probability score per feature.
+    MI catches non-linear relationships that correlation misses.
+    Returns per-feature risk scores + overall leakage verdict.
+    """
+    if target_column not in df.columns:
+        return {"features": {}, "verdict": "Target column not found"}
+
+    y = df[target_column].dropna()
+    if not pd.api.types.is_numeric_dtype(y):
+        return {"features": {}, "verdict": "Non-numeric target — MI not applicable"}
+
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                    if c != target_column]
+    if not numeric_cols:
+        return {"features": {}, "verdict": "No numeric features"}
+
+    try:
+        from sklearn.feature_selection import mutual_info_regression
+        from sklearn.preprocessing import StandardScaler
+
+        X = df[numeric_cols].copy()
+        # Fill NaN with median for MI computation
+        for col in X.columns:
+            X[col] = X[col].fillna(X[col].median())
+
+        aligned_y = y.reindex(X.index).dropna()
+        X = X.loc[aligned_y.index]
+
+        mi_scores = mutual_info_regression(X, aligned_y, random_state=42)
+        mi_scores_norm = mi_scores / (mi_scores.max() + 1e-8)  # normalize 0-1
+
+        features: dict[str, dict] = {}
+        for col, mi_raw, mi_norm in zip(numeric_cols, mi_scores, mi_scores_norm):
+            corr = abs(float(df[col].corr(y))) if not np.isnan(df[col].corr(y)) else 0
+
+            # Leakage probability = weighted combo of MI + correlation
+            leak_prob = round(float(0.5 * mi_norm + 0.5 * corr), 4)
+
+            if leak_prob > 0.85:
+                risk = "🔴 CRITICAL"
+                verdict = "Almost certainly leakage — feature contains target information"
+            elif leak_prob > 0.70:
+                risk = "🟠 HIGH"
+                verdict = "Strong leakage signal — verify this feature is available at prediction time"
+            elif leak_prob > 0.50:
+                risk = "🟡 MODERATE"
+                verdict = "Elevated MI — may be derived from target or causally linked"
+            elif leak_prob > 0.30:
+                risk = "🟢 LOW"
+                verdict = "Some predictive signal — likely legitimate"
+            else:
+                risk = "✅ SAFE"
+                verdict = "Low mutual information — safe to use"
+
+            features[col] = {
+                "mi_score":        round(float(mi_raw), 5),
+                "mi_normalized":   round(float(mi_norm), 4),
+                "correlation":     round(corr, 4),
+                "leakage_prob":    leak_prob,
+                "risk_level":      risk,
+                "verdict":         verdict,
+            }
+
+        # Sort by leakage probability
+        features = dict(sorted(features.items(),
+                               key=lambda x: x[1]["leakage_prob"], reverse=True))
+
+        critical = [k for k, v in features.items() if v["leakage_prob"] > 0.85]
+        high     = [k for k, v in features.items() if 0.70 < v["leakage_prob"] <= 0.85]
+
+        overall_verdict = (
+            f"🔴 CRITICAL: {len(critical)} feature(s) show extremely high leakage probability: {critical}"
+            if critical else (
+                f"🟠 HIGH RISK: {len(high)} feature(s) have elevated leakage scores — review before training"
+                if high else "✅ No significant leakage probability detected across all features"
+            )
+        )
+
+        return {
+            "features":       features,
+            "verdict":        overall_verdict,
+            "n_critical":     len(critical),
+            "n_high":         len(high),
+            "critical_cols":  critical,
+        }
+
+    except Exception as e:
+        return {"features": {}, "verdict": f"MI computation failed: {str(e)}", "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 2 — FEATURE 10
+# OUTLIER ROOT CAUSE ANALYSIS (Mahalanobis Distance)
+# ─────────────────────────────────────────────────────────────────
+
+def analyze_outlier_root_cause(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
+    """
+    Mahalanobis distance detects multivariate outliers —
+    rows that are outliers in the COMBINATION of features,
+    not just in any single column individually.
+    Also checks if outliers cluster in time (date column).
+    """
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                    if c != target_column]
+
+    if len(numeric_cols) < 2:
+        return {"available": False, "reason": "Need at least 2 numeric features"}
+
+    X = df[numeric_cols].copy()
+    for col in X.columns:
+        X[col] = X[col].fillna(X[col].median())
+
+    # Cap to 1000 rows for speed
+    if len(X) > 1000:
+        X = X.sample(1000, random_state=42)
+
+    try:
+        from sklearn.covariance import EllipticEnvelope
+
+        # Mahalanobis via EllipticEnvelope (robust covariance)
+        envelope  = EllipticEnvelope(contamination=0.05, random_state=42)
+        outlier_mask = envelope.fit_predict(X) == -1
+        mahal_scores = envelope.mahalanobis(X)
+
+        n_outliers = int(outlier_mask.sum())
+        pct        = round(n_outliers / len(X) * 100, 1)
+
+        # Which features contribute most to outlier scores
+        outlier_rows = X[outlier_mask]
+        normal_rows  = X[~outlier_mask]
+
+        feature_contribution: dict[str, dict] = {}
+        for col in numeric_cols[:15]:
+            if col not in X.columns:
+                continue
+            out_mean = float(outlier_rows[col].mean()) if len(outlier_rows) > 0 else 0
+            nor_mean = float(normal_rows[col].mean())  if len(normal_rows) > 0  else 0
+            shift_pct = abs(out_mean - nor_mean) / (abs(nor_mean) + 1e-8) * 100
+            feature_contribution[col] = {
+                "outlier_mean": round(out_mean, 4),
+                "normal_mean":  round(nor_mean, 4),
+                "shift_pct":    round(shift_pct, 1),
+                "major_driver": shift_pct > 50,
+            }
+
+        # Sort by shift
+        feature_contribution = dict(
+            sorted(feature_contribution.items(),
+                   key=lambda x: x[1]["shift_pct"], reverse=True)
+        )
+        major_drivers = [k for k, v in feature_contribution.items() if v["major_driver"]]
+
+        # IQR outlier count per column for comparison
+        iqr_counts: dict[str, int] = {}
+        for col in numeric_cols[:15]:
+            if col not in df.columns:
+                continue
+            q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+            iqr    = q3 - q1
+            n = int(((df[col] < q1 - 1.5*iqr) | (df[col] > q3 + 1.5*iqr)).sum())
+            if n > 0:
+                iqr_counts[col] = n
+
+        interpretation = []
+        if pct < 3:
+            interpretation.append(f"✅ Only {pct}% multivariate outliers — dataset is clean.")
+        elif pct < 8:
+            interpretation.append(f"🟡 {pct}% multivariate outliers — moderate. Review before training.")
+        else:
+            interpretation.append(f"🔴 {pct}% multivariate outliers — significant. Investigate before training.")
+
+        if major_drivers:
+            interpretation.append(
+                f"Primary outlier drivers: {major_drivers[:3]}. "
+                "These features show the largest mean shift between outlier and normal rows."
+            )
+
+        # New insight: IQR vs Mahalanobis comparison
+        interpretation.append(
+            f"IQR method found outliers in {len(iqr_counts)} individual columns. "
+            f"Mahalanobis found {n_outliers} rows that are unusual in COMBINATION — "
+            "these multivariate outliers would be missed by column-wise IQR."
+        )
+
+        return {
+            "available":             True,
+            "n_outliers":            n_outliers,
+            "pct_outliers":          pct,
+            "feature_contribution":  feature_contribution,
+            "major_drivers":         major_drivers,
+            "iqr_counts":            iqr_counts,
+            "mahal_scores":          sorted(mahal_scores.tolist(), reverse=True)[:20],
+            "interpretation":        interpretation,
+        }
+
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 2 — FEATURE 11
+# DATA DRIFT SIMULATION (First Half vs Second Half)
+# ─────────────────────────────────────────────────────────────────
+
+def simulate_data_drift(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
+    """
+    Splits dataset into first 50% and second 50% (by row order).
+    Compares feature distributions using KS test.
+    Simulates what drift looks like over time without needing a test set.
+    Critical for time-series and sequential data.
+    """
+    n = len(df)
+    if n < 50:
+        return {"available": False, "reason": "Need at least 50 rows for drift simulation"}
+
+    half      = n // 2
+    df_first  = df.iloc[:half]
+    df_second = df.iloc[half:]
+
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                    if c != target_column]
+
+    drift_results: list[dict] = []
+    drifted_cols:  list[str]  = []
+
+    for col in numeric_cols[:20]:
+        try:
+            s1 = df_first[col].dropna()
+            s2 = df_second[col].dropna()
+            if len(s1) < 10 or len(s2) < 10:
+                continue
+
+            ks_stat, p_val = scipy_stats.ks_2samp(s1, s2)
+            mean1 = float(s1.mean())
+            mean2 = float(s2.mean())
+            std1  = float(s1.std())
+            std2  = float(s2.std())
+            mean_shift = round(abs(mean2 - mean1) / (abs(mean1) + 1e-8) * 100, 1)
+            std_shift  = round(abs(std2 - std1) / (abs(std1) + 1e-8) * 100, 1)
+
+            drifted = p_val < 0.05
+            if drifted:
+                drifted_cols.append(col)
+
+            severity = (
+                "🔴 HIGH"   if ks_stat > 0.3 else
+                "🟡 MEDIUM" if ks_stat > 0.15 else
+                "🟢 LOW"
+            )
+
+            drift_results.append({
+                "feature":     col,
+                "ks_stat":     round(float(ks_stat), 4),
+                "p_value":     round(float(p_val), 4),
+                "drifted":     drifted,
+                "severity":    severity,
+                "mean_first":  round(mean1, 4),
+                "mean_second": round(mean2, 4),
+                "mean_shift":  mean_shift,
+                "std_shift":   std_shift,
+            })
+        except Exception:
+            continue
+
+    drift_results.sort(key=lambda x: x["ks_stat"], reverse=True)
+
+    n_drifted  = len(drifted_cols)
+    drift_pct  = round(n_drifted / max(len(numeric_cols), 1) * 100, 1)
+
+    if drift_pct > 40:
+        verdict = "🔴 HIGH DRIFT — dataset distribution changes significantly over rows. Time-series or seasonal effects likely."
+        risk    = "HIGH"
+    elif drift_pct > 20:
+        verdict = "🟡 MODERATE DRIFT — some features change across the dataset. Monitor model performance over time."
+        risk    = "MEDIUM"
+    else:
+        verdict = "🟢 STABLE — feature distributions are consistent across the dataset."
+        risk    = "LOW"
+
+    interpretation = [
+        f"{n_drifted} of {len(drift_results)} features show statistically significant drift (p < 0.05).",
+        verdict,
+    ]
+    if drifted_cols:
+        interpretation.append(
+            f"Most drifted features: {drifted_cols[:5]}. "
+            "If training on the first half and predicting on the second, "
+            "these features may degrade model performance."
+        )
+    else:
+        interpretation.append(
+            "No significant drift detected — dataset appears stable across rows. "
+            "A random train/test split should work safely."
+        )
+
+    # Target drift
+    try:
+        y1 = df_first[target_column].dropna()
+        y2 = df_second[target_column].dropna()
+        if len(y1) > 5 and len(y2) > 5 and pd.api.types.is_numeric_dtype(y1):
+            ks_y, p_y = scipy_stats.ks_2samp(y1, y2)
+            target_drift = {
+                "ks_stat": round(float(ks_y), 4),
+                "p_value": round(float(p_y), 4),
+                "drifted": p_y < 0.05,
+                "mean_first":  round(float(y1.mean()), 4),
+                "mean_second": round(float(y2.mean()), 4),
+            }
+            if p_y < 0.05:
+                interpretation.append(
+                    f"⚠️ Target variable '{target_column}' also shows drift (KS={ks_y:.3f}) — "
+                    "the distribution of what you're predicting changes over time. "
+                    "Consider time-based train/test split."
+                )
+        else:
+            target_drift = None
+    except Exception:
+        target_drift = None
+
+    return {
+        "available":        True,
+        "drift_results":    drift_results,
+        "drifted_cols":     drifted_cols,
+        "drift_pct":        drift_pct,
+        "verdict":          verdict,
+        "risk":             risk,
+        "interpretation":   interpretation,
+        "n_first":          half,
+        "n_second":         n - half,
+        "target_drift":     target_drift,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 2 — FEATURE 12
+# ML PROBLEM FRAMING ASSISTANT (Groq)
+# ─────────────────────────────────────────────────────────────────
+
+def generate_problem_framings(
+    profile:       dict,
+    scorecard:     dict,
+    ts_info:       dict,
+    target_column: str,
+    task_type:     str,
+    api_key:       str | None = None,
+) -> list[dict[str, str]]:
+    """
+    Groq suggests 3 different ML problems the user could solve
+    with this dataset — with target, model, difficulty, and use case.
+    Falls back to rule-based suggestions if no API key.
+    """
+    key = api_key or os.environ.get("GROQ_API_KEY", "")
+
+    context = {
+        "rows":       profile.get("rows", 0),
+        "columns":    profile.get("columns", 0),
+        "numeric":    profile.get("numeric_features", 0),
+        "categorical":profile.get("categorical_features", 0),
+        "target":     target_column,
+        "task":       task_type,
+        "grade":      scorecard.get("overall_grade", "?"),
+        "timeseries": ts_info.get("is_timeseries", False),
+        "frequency":  ts_info.get("frequency_guess", ""),
+        "top_cols":   list(profile.get("top_correlations", {}).keys())[:5],
+    }
+
+    if key:
+        try:
+            from groq import Groq
+            client = Groq(api_key=key)
+
+            prompt = f"""You are a senior ML engineer. Given the dataset profile below, suggest exactly 3 different ML problems this dataset could solve.
+
+Dataset profile: {json.dumps(context)}
+
+Return ONLY a valid JSON array of exactly 3 objects, each with these exact keys:
+[
+  {{
+    "title": "Short problem title (5 words max)",
+    "target_suggestion": "Which column to predict or cluster",
+    "problem_type": "Regression / Classification / Clustering / Forecasting",
+    "model_recommendation": "Specific algorithm to use",
+    "difficulty": "Easy / Medium / Hard",
+    "business_use_case": "One sentence real-world application",
+    "why_this_data": "One sentence on why this dataset suits this problem"
+  }}
+]
+
+Rules: Be specific to this dataset's actual columns. No generic suggestions. No markdown. Pure JSON array only."""
+
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+                temperature=0.5,
+            )
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:-1])
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) and len(parsed) == 3:
+                return parsed
+        except Exception:
+            pass
+
+    # Rule-based fallback
+    framings = []
+    top_cols = list(profile.get("top_correlations", {}).keys())[:3]
+
+    if ts_info.get("is_timeseries"):
+        framings.append({
+            "title":              "Time-Series Forecasting",
+            "target_suggestion":  target_column,
+            "problem_type":       "Forecasting",
+            "model_recommendation": "ARIMA or XGBoost with lag features",
+            "difficulty":         "Hard",
+            "business_use_case":  "Predict future values of the target variable based on historical patterns",
+            "why_this_data":      f"Dataset has {ts_info['frequency_guess']} frequency — ideal for sequential forecasting",
+        })
+    else:
+        framings.append({
+            "title":              "Regression — Predict Target",
+            "target_suggestion":  target_column,
+            "problem_type":       "Regression",
+            "model_recommendation": "XGBoost with default hyperparameters",
+            "difficulty":         "Medium",
+            "business_use_case":  f"Predict the value of '{target_column}' from other features",
+            "why_this_data":      f"{profile.get('numeric_features',0)} numeric features provide rich signal for regression",
+        })
+
+    if top_cols:
+        framings.append({
+            "title":              "Binary Classification",
+            "target_suggestion":  f"Binarize '{target_column}' at median threshold",
+            "problem_type":       "Classification",
+            "model_recommendation": "LightGBM with class_weight='balanced'",
+            "difficulty":         "Easy",
+            "business_use_case":  f"Classify whether '{target_column}' is above or below the median — useful for threshold-based decisions",
+            "why_this_data":      f"Strong correlators ({top_cols[:2]}) make this a viable binary classification task",
+        })
+
+    framings.append({
+        "title":              "Unsupervised Clustering",
+        "target_suggestion":  "No target — discover natural groups",
+        "problem_type":       "Clustering",
+        "model_recommendation": "KMeans (k=3-5) or DBSCAN",
+        "difficulty":         "Easy",
+        "business_use_case":  "Segment records into meaningful groups for pattern discovery or anomaly detection",
+        "why_this_data":      f"{profile.get('numeric_features',0)} numeric features enable meaningful distance-based clustering",
+    })
+
+    return framings[:3]
