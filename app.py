@@ -31,6 +31,11 @@ from src.debugger_engine import (
     check_sample_size,
     build_scorecard,
     apply_automated_fixes,
+    # Milestone 2
+    compute_leakage_probability,
+    analyze_outlier_root_cause,
+    simulate_data_drift,
+    generate_problem_framings,
 )
 from src.report_generator import generate_groq_report, generate_pdf
 
@@ -39,8 +44,8 @@ FALLBACK = Path("data/initial_dataset.csv")
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
-PAGES = ["Upload", "Audit", "Deep Analysis", "Scorecard", "Report"]
-ICONS = ["📁", "🔍", "🧬", "📊", "📄"]
+PAGES = ["Upload", "Audit", "Deep Analysis", "Intelligence", "Scorecard", "Report"]
+ICONS = ["📁", "🔍", "🧬", "🧠", "📊", "📄"]
 
 defaults = {
     "page": 0,
@@ -66,6 +71,12 @@ defaults = {
     "analysis_done": False,
     "report_done": False,
     "api_key": "",
+    # Milestone 2
+    "leakage_prob": {},
+    "outlier_rca": {},
+    "drift_sim": {},
+    "problem_framings": [],
+    "m2_done": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -156,8 +167,9 @@ completed = {
     0: S["df"] is not None,
     1: S["analysis_done"],
     2: S["analysis_done"],
-    3: S["analysis_done"],
-    4: S["report_done"],
+    3: S["m2_done"],
+    4: S["m2_done"],
+    5: S["report_done"],
 }
 
 # ─────────────────────────────────────────────
@@ -273,9 +285,15 @@ if cur == 0:
     if df is not None:
         S["df"] = df
         # Reset downstream state when new file uploaded
-        for k in ["analysis_done","report_done","fixed_df","fix_actions",
-                  "report_sections","pdf_bytes"]:
-            S[k] = False if k in ["analysis_done","report_done"] else (None if k in ["fixed_df","pdf_bytes"] else [])
+        for k in ["analysis_done","report_done","m2_done","fixed_df","fix_actions",
+                  "report_sections","pdf_bytes","leakage_prob","outlier_rca",
+                  "drift_sim","problem_framings"]:
+            if k in ["analysis_done","report_done","m2_done"]:
+                S[k] = False
+            elif k in ["fixed_df","pdf_bytes","leakage_prob","outlier_rca","drift_sim"]:
+                S[k] = None
+            else:
+                S[k] = []
 
         k1,k2,k3,k4,k5 = st.columns(5)
         kpi(k1, f"{df.shape[0]:,}", "Rows")
@@ -805,13 +823,307 @@ elif cur == 2:
     st.markdown("<br>", unsafe_allow_html=True)
     c1, c2 = st.columns([1,5])
     c1.button("← Audit", on_click=lambda: go_to(1))
-    c2.button("View Scorecard →", type="primary", on_click=lambda: go_to(3))
+    c2.button("Intelligence Layer →", type="primary", on_click=lambda: go_to(3))
+
 
 
 # ══════════════════════════════════════════════
-# PAGE 3 — SCORECARD
+# PAGE 3 — INTELLIGENCE LAYER (Milestone 2)
 # ══════════════════════════════════════════════
 elif cur == 3:
+    if not S["analysis_done"]:
+        st.warning("Run the audit first.")
+        st.button("← Go to Audit", on_click=lambda: go_to(1))
+        st.stop()
+
+    st.markdown("## 🧠 Intelligence Layer")
+
+    if not S["m2_done"]:
+        log_box   = st.empty()
+        log_lines: list[str] = []
+
+        def log2(msg):
+            log_lines.append(msg)
+            log_box.markdown(
+                "".join(f'<div class="pline">{l}</div>' for l in log_lines[-15:]),
+                unsafe_allow_html=True,
+            )
+
+        log2("🧠 Running intelligence analysis...")
+
+        log2("🔬 Computing leakage probability scores (mutual information)...")
+        S["leakage_prob"] = compute_leakage_probability(S["df"], S["target_column"])
+        n_crit = S["leakage_prob"].get("n_critical", 0)
+        log2(f"  ✅ {len(S['leakage_prob'].get('features',{}))} features scored — {n_crit} critical")
+
+        log2("🎯 Analysing outlier root causes (Mahalanobis distance)...")
+        S["outlier_rca"] = analyze_outlier_root_cause(S["df"], S["target_column"])
+        if S["outlier_rca"].get("available"):
+            log2(f"  ✅ {S['outlier_rca']['pct_outliers']}% multivariate outliers detected")
+        else:
+            log2(f"  ⚠️ {S['outlier_rca'].get('reason','Not available')}")
+
+        log2("📡 Simulating data drift (first half vs second half)...")
+        S["drift_sim"] = simulate_data_drift(S["df"], S["target_column"])
+        if S["drift_sim"].get("available"):
+            log2(f"  ✅ {S['drift_sim']['drift_pct']}% features show drift — {S['drift_sim']['risk']} risk")
+        else:
+            log2(f"  ⚠️ {S['drift_sim'].get('reason','Not available')}")
+
+        log2("🤖 Generating ML problem framings...")
+        S["problem_framings"] = generate_problem_framings(
+            S["profile"], S["scorecard"], S["ts_info"],
+            S["target_column"], S["task_type"],
+            api_key=S["api_key"] or None,
+        )
+        log2(f"  ✅ {len(S['problem_framings'])} problem framings generated")
+
+        S["m2_done"] = True
+        log2("✅ Intelligence layer complete!")
+        time.sleep(0.2)
+        log_box.empty()
+
+    # ── TABS ─────────────────────────────────
+    tabs_m2 = st.tabs([
+        "🔬 Leakage Probability",
+        "🎯 Outlier Root Cause",
+        "📡 Drift Simulation",
+        "💡 Problem Framings",
+    ])
+
+    # ── Leakage Probability ──────────────────
+    with tabs_m2[0]:
+        lp = S["leakage_prob"]
+
+        verdict_lp = lp.get("verdict", "")
+        vcol = "#ef4444" if "CRITICAL" in verdict_lp else ("#f97316" if "HIGH" in verdict_lp else "#22c55e")
+        st.markdown(
+            f'<div class="card" style="border-color:{vcol}40;padding:12px 16px;margin-bottom:14px">' +
+            f'<span style="color:{vcol};font-weight:700">{verdict_lp}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        feats = lp.get("features", {})
+        if feats:
+            k1, k2, k3 = st.columns(3)
+            kpi(k1, str(lp.get("n_critical", 0)), "Critical Leakage")
+            kpi(k2, str(lp.get("n_high", 0)), "High Risk")
+            kpi(k3, str(len(feats)), "Features Scored")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            section_title("Leakage Probability Scores (MI + Correlation)")
+
+            lp_rows = []
+            for col, v in feats.items():
+                lp_rows.append({
+                    "Feature":        col,
+                    "MI Score":       v["mi_score"],
+                    "Correlation":    v["correlation"],
+                    "Leakage Prob":   v["leakage_prob"],
+                    "Risk Level":     v["risk_level"],
+                    "Verdict":        v["verdict"],
+                })
+            lp_df = pd.DataFrame(lp_rows)
+            st.dataframe(lp_df, use_container_width=True, hide_index=True)
+
+            # Bar chart
+            fig = px.bar(
+                lp_df.head(15).sort_values("Leakage Prob"),
+                x="Leakage Prob", y="Feature", orientation="h",
+                color="Leakage Prob", color_continuous_scale="RdYlGn_r",
+                template="plotly_dark", title="Leakage Probability per Feature",
+            )
+            fig.add_vline(x=0.85, line_dash="dash", line_color="#ef4444",
+                          annotation_text="Critical threshold (0.85)")
+            fig.add_vline(x=0.70, line_dash="dash", line_color="#f97316",
+                          annotation_text="High risk (0.70)")
+            fig.update_layout(paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+                              coloraxis_showscale=False, margin=dict(t=30))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Outlier Root Cause ───────────────────
+    with tabs_m2[1]:
+        rca = S["outlier_rca"]
+        if not rca.get("available"):
+            st.warning(rca.get("reason", "Outlier RCA not available."))
+        else:
+            k1, k2, k3 = st.columns(3)
+            kpi(k1, str(rca.get("n_outliers", 0)), "Multivariate Outliers")
+            kpi(k2, f"{rca.get('pct_outliers', 0)}%", "Outlier Rate")
+            kpi(k3, str(len(rca.get("major_drivers", []))), "Major Drivers")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            for interp in rca.get("interpretation", []):
+                vcol = "card-red" if "🔴" in interp else ("card-amber" if "🟡" in interp else "card-green")
+                st.markdown(
+                    f'<div class="card {vcol}" style="padding:9px 13px;font-size:0.87rem;margin-bottom:6px">{interp}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            section_title("Feature Mean Shift: Outliers vs Normal Rows")
+            fc = rca.get("feature_contribution", {})
+            if fc:
+                fc_rows = []
+                for col, v in fc.items():
+                    fc_rows.append({
+                        "Feature":       col,
+                        "Outlier Mean":  v["outlier_mean"],
+                        "Normal Mean":   v["normal_mean"],
+                        "Shift %":       v["shift_pct"],
+                        "Major Driver":  "🔴 Yes" if v["major_driver"] else "✅ No",
+                    })
+                fc_df = pd.DataFrame(fc_rows).sort_values("Shift %", ascending=False)
+                st.dataframe(fc_df, use_container_width=True, hide_index=True)
+
+                fig = px.bar(
+                    fc_df.head(12).sort_values("Shift %"),
+                    x="Shift %", y="Feature", orientation="h",
+                    color="Shift %", color_continuous_scale="Reds",
+                    template="plotly_dark", title="Mean Shift in Outlier Rows (%)",
+                )
+                fig.update_layout(paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+                                  coloraxis_showscale=False, margin=dict(t=30))
+                st.plotly_chart(fig, use_container_width=True)
+
+            # Mahalanobis score distribution
+            mahal = rca.get("mahal_scores", [])
+            if mahal:
+                fig2 = px.histogram(x=mahal, nbins=20, template="plotly_dark",
+                                    color_discrete_sequence=["#3b82f6"],
+                                    labels={"x": "Mahalanobis Distance"},
+                                    title="Mahalanobis Score Distribution (Top 20)")
+                fig2.update_layout(paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+                                   margin=dict(t=30))
+                st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Drift Simulation ─────────────────────
+    with tabs_m2[2]:
+        drift = S["drift_sim"]
+        if not drift.get("available"):
+            st.warning(drift.get("reason", "Drift simulation not available."))
+        else:
+            verdict_d = drift.get("verdict", "")
+            risk      = drift.get("risk", "LOW")
+            vcol = "#ef4444" if risk=="HIGH" else ("#f59e0b" if risk=="MEDIUM" else "#22c55e")
+            vcls = "card-red" if risk=="HIGH" else ("card-amber" if risk=="MEDIUM" else "card-green")
+
+            st.markdown(
+                f'<div class="card {vcls}" style="padding:12px 16px;margin-bottom:14px">' +
+                f'<span style="color:{vcol};font-weight:700">{verdict_d}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+            k1, k2, k3, k4 = st.columns(4)
+            kpi(k1, str(drift.get("n_first", 0)), "First Half Rows")
+            kpi(k2, str(drift.get("n_second", 0)), "Second Half Rows")
+            kpi(k3, f"{drift.get('drift_pct', 0)}%", "Features Drifted")
+            kpi(k4, risk, "Drift Risk")
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            for interp in drift.get("interpretation", []):
+                vcol2 = "card-red" if "🔴" in interp else ("card-amber" if "⚠️" in interp or "🟡" in interp else "card-green")
+                st.markdown(
+                    f'<div class="card {vcol2}" style="padding:9px 13px;font-size:0.87rem;margin-bottom:6px">{interp}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            dr = drift.get("drift_results", [])
+            if dr:
+                section_title("Per-Feature Drift Report")
+                dr_df = pd.DataFrame([{
+                    "Feature":     r["feature"],
+                    "KS Statistic": r["ks_stat"],
+                    "p-value":     r["p_value"],
+                    "Drifted":     "🔴 YES" if r["drifted"] else "🟢 NO",
+                    "Severity":    r["severity"],
+                    "Mean Shift %": r["mean_shift"],
+                } for r in dr])
+                st.dataframe(dr_df, use_container_width=True, hide_index=True)
+
+                # KS stat chart
+                fig = px.bar(
+                    dr_df.sort_values("KS Statistic"),
+                    x="KS Statistic", y="Feature", orientation="h",
+                    color="KS Statistic", color_continuous_scale="RdYlGn_r",
+                    template="plotly_dark", title="KS Statistic per Feature (Higher = More Drift)",
+                )
+                fig.add_vline(x=0.3, line_dash="dash", line_color="#ef4444",
+                              annotation_text="High drift (0.3)")
+                fig.add_vline(x=0.15, line_dash="dash", line_color="#f59e0b",
+                              annotation_text="Medium drift (0.15)")
+                fig.update_layout(paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+                                  coloraxis_showscale=False, margin=dict(t=30))
+                st.plotly_chart(fig, use_container_width=True)
+
+            td = drift.get("target_drift")
+            if td and td.get("drifted"):
+                tgt_name = S['target_column']
+                m1 = td['mean_first']
+                m2 = td['mean_second']
+                ks = td['ks_stat']
+                drift_msg = (f'<div class="card card-red" style="padding:9px 13px;font-size:0.87rem">'
+                             f'Target Drift: {tgt_name} shifts. '
+                             f'First half mean: {m1} | Second half mean: {m2} (KS={ks})</div>')
+                st.markdown(drift_msg, unsafe_allow_html=True)
+    # ── Problem Framings ─────────────────────
+    with tabs_m2[3]:
+        framings = S["problem_framings"]
+        if S["api_key"]:
+            st.markdown('<span class="badge badge-ok">🤖 Generated by Groq LLaMA 3.3 70B</span>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="badge badge-warn">⚙️ Rule-based — add Groq API key for AI-generated framings</span>',
+                        unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        diff_colors = {"Easy": "#22c55e", "Medium": "#f59e0b", "Hard": "#ef4444"}
+        type_colors = {
+            "Regression": "#3b82f6", "Classification": "#8b5cf6",
+            "Clustering": "#06b6d4", "Forecasting": "#f59e0b",
+        }
+
+        for i, framing in enumerate(framings):
+            diff  = framing.get("difficulty", "Medium")
+            ptype = framing.get("problem_type", "")
+            dc    = diff_colors.get(diff, "#94a3b8")
+            tc    = type_colors.get(ptype, "#94a3b8")
+
+            st.markdown(
+                f'<div class="card" style="margin-bottom:12px">' +
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+                f'<div style="font-size:1.4rem;font-weight:900;color:#1e3a5c;width:32px;text-align:center">{i+1}</div>' +
+                f'<div style="flex:1">' +
+                f'<div style="font-size:1rem;font-weight:700;color:#e2e8f0">{framing.get("title","")}</div>' +
+                f'<div style="display:flex;gap:6px;margin-top:4px">' +
+                f'<span class="badge" style="background:{tc}20;color:{tc};border:1px solid {tc}40">{ptype}</span>' +
+                f'<span class="badge" style="background:{dc}20;color:{dc};border:1px solid {dc}40">{diff}</span>' +
+                f'</div></div></div>' +
+                f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:0.85rem">' +
+                f'<div><span style="color:#334155;font-size:0.72rem;text-transform:uppercase">Target</span>' +
+                f'<div style="color:#94a3b8">{framing.get("target_suggestion","")}</div></div>' +
+                f'<div><span style="color:#334155;font-size:0.72rem;text-transform:uppercase">Model</span>' +
+                f'<div style="color:#94a3b8">{framing.get("model_recommendation","")}</div></div>' +
+                f'<div><span style="color:#334155;font-size:0.72rem;text-transform:uppercase">Use Case</span>' +
+                f'<div style="color:#94a3b8">{framing.get("business_use_case","")}</div></div>' +
+                f'<div><span style="color:#334155;font-size:0.72rem;text-transform:uppercase">Why This Data</span>' +
+                f'<div style="color:#94a3b8">{framing.get("why_this_data","")}</div></div>' +
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns([1,5])
+    c1.button("← Deep Analysis", on_click=lambda: go_to(2))
+    c2.button("View Scorecard →", type="primary", on_click=lambda: go_to(4))
+
+
+# ══════════════════════════════════════════════
+# PAGE 4 — SCORECARD
+# ══════════════════════════════════════════════
+elif cur == 4:
     if not S["analysis_done"]:
         st.warning("Run the audit first.")
         st.button("← Go to Audit", on_click=lambda: go_to(1))
@@ -896,14 +1208,14 @@ elif cur == 3:
 
     st.markdown("<br>", unsafe_allow_html=True)
     c1, c2 = st.columns([1,5])
-    c1.button("← Deep Analysis", on_click=lambda: go_to(2))
-    c2.button("Generate Expert Report →", type="primary", on_click=lambda: go_to(4))
+    c1.button("← Intelligence", on_click=lambda: go_to(3))
+    c2.button("Generate Expert Report →", type="primary", on_click=lambda: go_to(5))
 
 
 # ══════════════════════════════════════════════
 # PAGE 4 — REPORT
 # ══════════════════════════════════════════════
-elif cur == 4:
+elif cur == 5:
     if not S["analysis_done"]:
         st.warning("Run the audit first.")
         st.button("← Go to Audit", on_click=lambda: go_to(1))
@@ -1001,7 +1313,7 @@ elif cur == 4:
             )
 
     c1, c2 = st.columns([1,5])
-    c1.button("← Scorecard", on_click=lambda: go_to(3))
+    c1.button("← Scorecard", on_click=lambda: go_to(4))
     if c2.button("🔄 Regenerate Report"):
         S["report_done"] = False
         st.rerun()
