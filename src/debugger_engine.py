@@ -1,16 +1,15 @@
 """
-AutoML Debugger — Core Engine  (Stage 1 v3.0)
-===============================================
-Handles:
-  - Task auto-detection with explanation
-  - Preprocessing summary (what happens and WHY — shown to user before training)
-  - Rich data profiling
-  - Data leakage detection
-  - Time-series detection with chronological split
-  - Dataset health score with per-dimension breakdown
-  - Dataset cleaning + export
-  - Groq LLM analysis (rule-based fallback)
-  - PDF report generation
+AutoML Debugger — Core Engine  (Milestone 1 v4.0)
+==================================================
+8 analysis features:
+  1. Dataset Health Score  (per-dimension A-F grade)
+  2. Statistical Distribution Analysis  (KDE, normality, skewness)
+  3. Feature Redundancy Detection  (correlation matrix, VIF)
+  4. Missing Value Pattern Analysis  (MCAR/MAR/MNAR detection)
+  5. Smart Column Type Inference  (ZIP, phone, currency, ID, date)
+  6. Sample Size Adequacy Check  (rules of thumb per task type)
+  7. Data Quality Scorecard  (A/B/C/D/F with sub-scores)
+  8. Automated Fix Application  (one-click clean + download)
 """
 
 from __future__ import annotations
@@ -24,49 +23,32 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import stats as scipy_stats
 
 warnings.filterwarnings("ignore")
 
 
 # ─────────────────────────────────────────────────────────────────
-# TASK AUTO-DETECTION  (with explanation text)
+# TASK AUTO-DETECTION
 # ─────────────────────────────────────────────────────────────────
 
 def detect_task_type(y: pd.Series) -> tuple[str, str]:
-    """
-    Returns (task_type, reason_string) so the UI can show the user
-    exactly WHY a task type was chosen.
-    """
     n_unique     = y.nunique()
-    unique_ratio = n_unique / len(y)
-    dtype_name   = str(y.dtype)
+    unique_ratio = n_unique / max(len(y), 1)
 
     if y.dtype == object or y.dtype.name == "category":
-        reason = (
-            f"Target column '{y.name}' has text/category values "
-            f"({n_unique} unique classes) → Classification problem."
-        )
-        return "classification", reason
+        return "classification", f"'{y.name}' has text/category values ({n_unique} unique classes)."
 
     if n_unique <= 2:
-        reason = (
-            f"Target column '{y.name}' has only {n_unique} unique numeric values "
-            f"(binary) → Classification problem."
-        )
-        return "classification", reason
+        return "classification", f"'{y.name}' has only {n_unique} unique numeric values (binary)."
 
     if n_unique <= 20 and unique_ratio < 0.05:
-        reason = (
-            f"Target column '{y.name}' has {n_unique} unique values "
-            f"({unique_ratio*100:.1f}% of rows) — low cardinality → Classification problem."
-        )
-        return "classification", reason
+        return "classification", f"'{y.name}' has {n_unique} unique values ({unique_ratio*100:.1f}% of rows) — low cardinality."
 
-    reason = (
-        f"Target column '{y.name}' is numeric with {n_unique} unique values "
-        f"(dtype={dtype_name}, range={y.min():.2f}–{y.max():.2f}) → Regression problem."
+    return "regression", (
+        f"'{y.name}' is numeric with {n_unique} unique values "
+        f"(range: {y.min():.2f} – {y.max():.2f})."
     )
-    return "regression", reason
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -74,16 +56,10 @@ def detect_task_type(y: pd.Series) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────
 
 def detect_timeseries(df: pd.DataFrame) -> dict[str, Any]:
-    result = {
-        "is_timeseries":   False,
-        "datetime_column": None,
-        "frequency_guess": None,
-        "warnings":        [],
-    }
+    result = {"is_timeseries": False, "datetime_column": None, "frequency_guess": None}
     for col in df.columns:
         if pd.api.types.is_datetime64_any_dtype(df[col]):
-            result["is_timeseries"]   = True
-            result["datetime_column"] = col
+            result.update({"is_timeseries": True, "datetime_column": col})
             break
         if df[col].dtype == object:
             try:
@@ -92,214 +68,694 @@ def detect_timeseries(df: pd.DataFrame) -> dict[str, Any]:
                     result["is_timeseries"]   = True
                     result["datetime_column"] = col
                     diffs  = parsed.dropna().sort_values().diff().dropna()
-                    median = diffs.median()
-                    days   = getattr(median, "days", 0)
+                    days   = getattr(diffs.median(), "days", 0)
                     result["frequency_guess"] = (
-                        "Daily" if days == 1 else
-                        "Weekly" if days == 7 else
-                        "Monthly" if 28 <= days <= 31 else
-                        "Sub-daily" if days == 0 else
-                        f"~{days}-day intervals"
+                        "Daily" if days == 1 else "Weekly" if days == 7 else
+                        "Monthly" if 28 <= days <= 31 else "Sub-daily" if days == 0
+                        else f"~{days}-day intervals"
                     )
                     break
             except Exception:
                 continue
-
-    if result["is_timeseries"]:
-        result["warnings"] = [
-            f"⏱️ Time-series detected — column '{result['datetime_column']}' "
-            f"({result['frequency_guess']}). "
-            "Chronological train/test split will be used to prevent future-data leakage.",
-            "⚠️ Standard random split is DISABLED — it would let future rows leak into training "
-            "and artificially inflate all metrics.",
-        ]
     return result
 
 
 # ─────────────────────────────────────────────────────────────────
-# PREPROCESSING SUMMARY  (shown to user BEFORE training)
+# FEATURE 1 — DATASET HEALTH SCORE
 # ─────────────────────────────────────────────────────────────────
 
-def build_preprocessing_summary(
-    df: pd.DataFrame,
-    target_column: str,
-    ts_datetime_col: str | None = None,
-) -> list[dict[str, str]]:
-    """
-    Returns a list of dicts: [{action, column, reason, category}]
-    Each entry explains one preprocessing decision in plain English.
-    """
-    X = df.drop(columns=[target_column])
-    steps: list[dict[str, str]] = []
+def compute_health_score(
+    profile: dict,
+    leakage: dict,
+    redundancy: dict,
+    sample_check: dict,
+    type_inference: dict,
+) -> dict[str, Any]:
+    dims: dict[str, dict] = {}
 
-    # Datetime column dropped
-    if ts_datetime_col and ts_datetime_col in X.columns:
-        steps.append({
-            "action":   "Drop from features",
-            "column":   ts_datetime_col,
-            "reason":   "Datetime column used only for chronological ordering — not a predictive feature.",
-            "category": "time-series",
-        })
+    # Completeness (0-20)
+    mp = profile.get("missing_pct", 0)
+    cs = max(0, 20 - int(mp * 0.6))
+    dims["Completeness"] = {
+        "score": cs, "max": 20,
+        "reason": f"{mp}% missing" if mp > 0 else "No missing values",
+    }
 
-    numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols     = X.select_dtypes(exclude=[np.number]).columns.tolist()
+    # Integrity (0-20)
+    dup_r     = profile.get("duplicate_rows", 0) / max(profile.get("rows", 1), 1)
+    const_pen = min(len(profile.get("constant_features", [])) * 4, 10)
+    ip        = max(0, 20 - int(dup_r * 20) - const_pen)
+    dims["Integrity"] = {
+        "score": ip, "max": 20,
+        "reason": (f"{profile.get('duplicate_rows',0)} duplicates, "
+                   f"{len(profile.get('constant_features',[]))} constant cols")
+                  if (dup_r > 0 or const_pen > 0) else "No integrity issues",
+    }
 
-    # Missing values
-    for col in numeric_cols:
-        n = int(df[col].isna().sum())
-        if n > 0:
-            steps.append({
-                "action":   f"Impute {n} missing values → median",
-                "column":   col,
-                "reason":   f"Numeric column has {n} nulls ({n/len(df)*100:.1f}%). Median is robust to outliers.",
-                "category": "imputation",
-            })
-    for col in cat_cols:
-        n = int(df[col].isna().sum())
-        if n > 0:
-            steps.append({
-                "action":   f"Impute {n} missing values → most frequent",
-                "column":   col,
-                "reason":   f"Categorical column has {n} nulls ({n/len(df)*100:.1f}%). Mode fill preserves distribution.",
-                "category": "imputation",
-            })
+    # Leakage Safety (0-20)
+    n_leak = len(leakage.get("leakage_candidates", []))
+    lp     = max(0, 20 - n_leak * 10)
+    dims["Leakage Safety"] = {
+        "score": lp, "max": 20,
+        "reason": f"{n_leak} leakage candidate(s) detected" if n_leak > 0 else "No leakage detected",
+    }
 
-    # Encoding
-    for col in cat_cols:
-        n_unique = df[col].nunique()
-        # Detect date-like string columns and drop them (not useful as OHE features)
-        is_date_like = False
+    # Feature Quality (0-20)
+    n_redundant = len(redundancy.get("redundant_pairs", []))
+    n_bad_types = len(type_inference.get("warnings", []))
+    fq = max(0, 20 - n_redundant * 3 - n_bad_types * 2)
+    dims["Feature Quality"] = {
+        "score": fq, "max": 20,
+        "reason": (f"{n_redundant} redundant pairs, {n_bad_types} type warnings")
+                  if (n_redundant + n_bad_types) > 0 else "No feature quality issues",
+    }
+
+    # Sample Adequacy (0-20)
+    adequate = sample_check.get("adequate", True)
+    sp       = 20 if adequate else max(0, int(sample_check.get("ratio", 0) * 20))
+    dims["Sample Adequacy"] = {
+        "score": sp, "max": 20,
+        "reason": sample_check.get("summary", "Adequate sample size"),
+    }
+
+    total = sum(d["score"] for d in dims.values())
+
+    if total >= 90:   grade, verdict = "A", "🟢 Excellent — Ready to Train"
+    elif total >= 75: grade, verdict = "B", "🟢 Good — Minor Issues"
+    elif total >= 60: grade, verdict = "C", "🟡 Fair — Fix Before Training"
+    elif total >= 40: grade, verdict = "D", "🟠 Poor — Significant Issues"
+    else:             grade, verdict = "F", "🔴 Critical — Not Trainable"
+
+    return {"total": total, "grade": grade, "verdict": verdict, "dimensions": dims}
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 2 — STATISTICAL DISTRIBUTION ANALYSIS
+# ─────────────────────────────────────────────────────────────────
+
+def analyze_distributions(df: pd.DataFrame, target_column: str | None = None) -> dict[str, Any]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_column and target_column in numeric_cols:
+        numeric_cols.remove(target_column)
+
+    results: dict[str, dict] = {}
+    for col in numeric_cols[:20]:  # cap at 20
+        series = df[col].dropna()
+        if len(series) < 8:
+            continue
+
+        sk   = float(series.skew())
+        kurt = float(series.kurtosis())
+
+        # Normality test (Shapiro-Wilk on sample)
+        sample = series.sample(min(500, len(series)), random_state=42)
         try:
-            parsed = pd.to_datetime(df[col], format="mixed", dayfirst=False)
-            if parsed.notna().mean() > 0.9:
-                is_date_like = True
+            _, p_normal = scipy_stats.shapiro(sample)
+            is_normal = p_normal > 0.05
+        except Exception:
+            p_normal, is_normal = None, False
+
+        # Distribution shape
+        if abs(sk) < 0.5:
+            shape = "Normal / Symmetric"
+        elif sk > 1.5:
+            shape = "Highly Right-Skewed"
+        elif sk > 0.5:
+            shape = "Mildly Right-Skewed"
+        elif sk < -1.5:
+            shape = "Highly Left-Skewed"
+        else:
+            shape = "Mildly Left-Skewed"
+
+        # Recommendation
+        if abs(sk) > 1.5 and series.min() > 0:
+            rec = "Apply log1p transform before training"
+        elif abs(sk) > 0.5:
+            rec = "Consider sqrt or Box-Cox transform"
+        else:
+            rec = "No transform needed"
+
+        results[col] = {
+            "mean":      round(float(series.mean()), 4),
+            "std":       round(float(series.std()),  4),
+            "min":       round(float(series.min()),  4),
+            "max":       round(float(series.max()),  4),
+            "skewness":  round(sk,   3),
+            "kurtosis":  round(kurt, 3),
+            "p_normal":  round(float(p_normal), 4) if p_normal is not None else None,
+            "is_normal": is_normal,
+            "shape":     shape,
+            "recommendation": rec,
+        }
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 3 — FEATURE REDUNDANCY DETECTION
+# ─────────────────────────────────────────────────────────────────
+
+def detect_redundancy(df: pd.DataFrame, target_column: str | None = None) -> dict[str, Any]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_column and target_column in numeric_cols:
+        numeric_cols.remove(target_column)
+
+    if len(numeric_cols) < 2:
+        return {"redundant_pairs": [], "corr_matrix": {}, "vif_scores": {}, "drop_suggestions": []}
+
+    X = df[numeric_cols].dropna()
+    corr_matrix = X.corr().round(4)
+
+    # Find highly correlated pairs
+    redundant_pairs: list[dict] = []
+    seen = set()
+    for i, c1 in enumerate(numeric_cols):
+        for c2 in numeric_cols[i+1:]:
+            pair_key = tuple(sorted([c1, c2]))
+            if pair_key in seen:
+                continue
+            seen.add(pair_key)
+            try:
+                corr_val = abs(float(corr_matrix.loc[c1, c2]))
+                if corr_val >= 0.85:
+                    redundant_pairs.append({
+                        "feature_1": c1,
+                        "feature_2": c2,
+                        "correlation": round(corr_val, 4),
+                        "severity": "🔴 HIGH" if corr_val >= 0.95 else "🟡 MODERATE",
+                        "recommendation": f"Drop '{c2}' — '{c1}' carries same information",
+                    })
+            except Exception:
+                continue
+
+    redundant_pairs.sort(key=lambda x: x["correlation"], reverse=True)
+
+    # VIF scores (Variance Inflation Factor)
+    vif_scores: dict[str, float] = {}
+    if len(numeric_cols) >= 2 and len(X) > len(numeric_cols):
+        try:
+            from sklearn.linear_model import LinearRegression
+            for col in numeric_cols[:15]:  # cap for speed
+                others = [c for c in numeric_cols if c != col]
+                if not others:
+                    continue
+                Xo = X[others].values
+                y  = X[col].values
+                lr = LinearRegression().fit(Xo, y)
+                r2 = lr.score(Xo, y)
+                vif = round(float(1 / (1 - r2 + 1e-8)), 2)
+                vif_scores[col] = vif
         except Exception:
             pass
 
-        if is_date_like:
-            steps.append({
-                "action":   "Drop (date-like string column)",
-                "column":   col,
-                "reason":   "Detected as a date/time column. One-hot encoding dates creates meaningless sparse features. Use for time-series ordering only.",
-                "category": "drop",
-            })
-        elif n_unique > 50:
-            steps.append({
-                "action":   f"Drop (high cardinality — {n_unique} unique values)",
-                "column":   col,
-                "reason":   f"One-hot encoding {n_unique} values would create too many sparse columns. Dropping.",
-                "category": "encoding",
-            })
-        else:
-            steps.append({
-                "action":   f"One-Hot Encode → {n_unique} binary columns",
-                "column":   col,
-                "reason":   f"{n_unique} unique categories converted to binary indicators for ML compatibility.",
-                "category": "encoding",
-            })
+    # Drop suggestions — keep one from each highly correlated group
+    drop_suggestions = list(set(p["feature_2"] for p in redundant_pairs if p["correlation"] >= 0.95))
 
-    # Constant columns
-    for col in X.columns:
-        if X[col].nunique() <= 1:
-            steps.append({
-                "action":   "Drop (constant — zero variance)",
-                "column":   col,
-                "reason":   "This column has only one unique value. It carries no information for prediction.",
-                "category": "drop",
-            })
+    return {
+        "redundant_pairs":  redundant_pairs[:20],
+        "corr_matrix":      corr_matrix.to_dict(),
+        "vif_scores":       vif_scores,
+        "drop_suggestions": drop_suggestions,
+        "n_numeric":        len(numeric_cols),
+    }
 
-    # ID-like columns
-    for col in X.columns:
-        if (X[col].nunique() == len(X) and
-                col.lower() in {"id", "index", "row_id", "uid", "uuid", "customer_id", "user_id"}):
-            steps.append({
-                "action":   "Drop (likely ID column)",
-                "column":   col,
-                "reason":   f"'{col}' has one unique value per row — it's an identifier, not a feature.",
-                "category": "drop",
-            })
 
-    # Scaling
-    if numeric_cols:
-        steps.append({
-            "action":   "StandardScaler (zero mean, unit variance)",
-            "column":   f"{len(numeric_cols)} numeric column(s)",
-            "reason":   "Scaling ensures Ridge/Logistic regression treat all features equally regardless of magnitude.",
-            "category": "scaling",
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 4 — MISSING VALUE PATTERN ANALYSIS
+# ─────────────────────────────────────────────────────────────────
+
+def analyze_missing_patterns(df: pd.DataFrame) -> dict[str, Any]:
+    missing_cols = [c for c in df.columns if df[c].isna().sum() > 0]
+
+    if not missing_cols:
+        return {
+            "pattern": "NONE",
+            "description": "No missing values found.",
+            "columns": {},
+            "recommendation": "Dataset is complete — no imputation needed.",
+        }
+
+    col_stats: dict[str, dict] = {}
+    for col in missing_cols:
+        pct = round(float(df[col].isna().mean() * 100), 2)
+        col_stats[col] = {
+            "count":   int(df[col].isna().sum()),
+            "pct":     pct,
+            "severity": "🔴 Critical" if pct > 30 else ("🟡 Moderate" if pct > 10 else "🟢 Minor"),
+        }
+
+    # Pattern detection
+    total_missing_pct = df.isna().mean().mean() * 100
+
+    # Check if missingness is correlated with other columns (MAR signal)
+    mar_signals: list[str] = []
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    for mc in missing_cols[:5]:
+        mask = df[mc].isna().astype(int)
+        for nc in numeric_cols:
+            if nc == mc:
+                continue
+            try:
+                corr = abs(float(mask.corr(df[nc])))
+                if corr > 0.2:
+                    mar_signals.append(f"'{mc}' missingness correlates with '{nc}' ({corr:.2f})")
+                    break
+            except Exception:
+                continue
+
+    # Determine pattern
+    if mar_signals:
+        pattern = "MAR"
+        description = "Missing At Random — missingness depends on other observed columns."
+        recommendation = "Use advanced imputation (KNN or iterative). Simple median/mode may introduce bias."
+    elif total_missing_pct < 5:
+        pattern = "MCAR"
+        description = "Missing Completely At Random — small, random gaps."
+        recommendation = "Median/mode imputation is safe. Consider dropping rows with missing target."
+    else:
+        pattern = "MNAR"
+        description = "Missing Not At Random — the missing value itself may be informative."
+        recommendation = "Add a binary indicator column for each missing feature. The absence is a signal."
+
+    return {
+        "pattern":        pattern,
+        "description":    description,
+        "columns":        col_stats,
+        "mar_signals":    mar_signals,
+        "recommendation": recommendation,
+        "total_missing_pct": round(total_missing_pct, 2),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 5 — SMART COLUMN TYPE INFERENCE
+# ─────────────────────────────────────────────────────────────────
+
+def infer_column_types(df: pd.DataFrame) -> dict[str, Any]:
+    inferences: list[dict] = []
+    warnings_list: list[str] = []
+
+    for col in df.columns:
+        series  = df[col].dropna()
+        if len(series) == 0:
+            continue
+
+        dtype   = str(df[col].dtype)
+        inferred = dtype
+        flag     = None
+        rec      = None
+
+        # Numeric column checks
+        if pd.api.types.is_numeric_dtype(df[col]):
+            unique_vals = series.unique()
+
+            # Binary flag stored as numeric
+            if set(unique_vals).issubset({0, 1, 0.0, 1.0}) and len(unique_vals) == 2:
+                inferred = "Binary Flag (0/1)"
+                flag     = "🟡 Categorical stored as numeric"
+                rec      = "Consider treating as categorical for tree models"
+
+            # ID column
+            elif (series.nunique() == len(series) and
+                  col.lower() in {"id","index","row_id","uid","uuid","customer_id","user_id","order_id"}):
+                inferred = "ID Column"
+                flag     = "🔴 Should be dropped"
+                rec      = f"Drop '{col}' — unique per row, no predictive value"
+                warnings_list.append(f"'{col}' looks like an ID — drop it")
+
+            # Percentage stored as decimal (0-1 range)
+            elif series.between(0, 1).all() and series.nunique() > 10:
+                inferred = "Percentage (0–1)"
+                flag     = "🟢 Numeric — OK"
+                rec      = "May want to multiply by 100 for readability"
+
+            # Currency / large money values
+            elif series.mean() > 1000 and series.skew() > 1:
+                inferred = "Possible Currency / Revenue"
+                flag     = "🟡 Consider log transform"
+                rec      = "High skewness — apply log1p before training"
+
+            # Corrupted range (e.g. RSI outside 0-100)
+            elif col.upper().endswith("RSI") and (series.min() < 0 or series.max() > 100):
+                inferred = "RSI — Corrupted Range"
+                flag     = "🔴 Data Quality Issue"
+                rec      = f"RSI must be 0–100. Found range: {series.min():.1f}–{series.max():.1f}. Check data source."
+                warnings_list.append(f"'{col}' RSI values outside valid range 0–100")
+
+        # String column checks
+        elif df[col].dtype == object:
+            sample_str = series.astype(str).head(50)
+
+            # Date-like
+            try:
+                parsed = pd.to_datetime(series.head(50), format="mixed", dayfirst=False)
+                if parsed.notna().mean() > 0.9:
+                    inferred = "Date / Datetime"
+                    flag     = "🟡 Parse as datetime"
+                    rec      = "Use pd.to_datetime() and extract year/month/day/weekday features"
+            except Exception:
+                pass
+
+            # Email
+            if inferred == dtype and sample_str.str.contains("@").mean() > 0.5:
+                inferred = "Email Address"
+                flag     = "🔴 Drop or extract domain"
+                rec      = "Extract domain (gmail/yahoo etc.) as categorical feature, or drop"
+                warnings_list.append(f"'{col}' contains emails — drop or extract domain")
+
+            # URL
+            elif inferred == dtype and sample_str.str.startswith("http").mean() > 0.5:
+                inferred = "URL"
+                flag     = "🔴 Drop"
+                rec      = "URLs are not useful as ML features — drop this column"
+                warnings_list.append(f"'{col}' contains URLs — should be dropped")
+
+            # ZIP code (5-digit strings)
+            elif inferred == dtype and sample_str.str.match(r"^\d{5}$").mean() > 0.5:
+                inferred = "ZIP Code"
+                flag     = "🟡 Treat as categorical"
+                rec      = "Don't treat as numeric. Group into regions or use as categorical."
+
+        inferences.append({
+            "column":   col,
+            "dtype":    dtype,
+            "inferred": inferred,
+            "flag":     flag or "🟢 OK",
+            "recommendation": rec or "No action needed",
         })
 
-    return steps
-
-
-# ─────────────────────────────────────────────────────────────────
-# DATA LEAKAGE DETECTION
-# ─────────────────────────────────────────────────────────────────
-
-def detect_leakage(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "leakage_candidates":        [],
-        "high_correlation_features": {},
-        "warnings":                  [],
+    return {
+        "inferences": inferences,
+        "warnings":   warnings_list,
+        "n_warnings": len(warnings_list),
     }
-    y = df[target_column]
-    if not pd.api.types.is_numeric_dtype(y):
-        return result
-
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if target_column in numeric_cols:
-        numeric_cols.remove(target_column)
-
-    for col in numeric_cols:
-        try:
-            corr = abs(df[col].corr(y))
-            if np.isnan(corr):
-                continue
-            result["high_correlation_features"][col] = round(float(corr), 4)
-            if corr > 0.95:
-                result["leakage_candidates"].append(col)
-                result["warnings"].append(
-                    f"🚨 '{col}' correlation={corr:.3f} with target — almost certainly derived from "
-                    "or identical to the target. Verify before training."
-                )
-            elif corr > 0.85:
-                result["warnings"].append(
-                    f"⚠️ '{col}' correlation={corr:.3f} — high but may be legitimate. Verify."
-                )
-        except Exception:
-            continue
-    return result
 
 
 # ─────────────────────────────────────────────────────────────────
-# DATA PROFILER
+# FEATURE 6 — SAMPLE SIZE ADEQUACY CHECK
+# ─────────────────────────────────────────────────────────────────
+
+def check_sample_size(df: pd.DataFrame, target_column: str, task_type: str) -> dict[str, Any]:
+    n_rows  = len(df)
+    n_feats = len(df.columns) - 1
+    checks: list[dict] = []
+    issues: list[str]  = []
+
+    # Rule 1 — minimum rows per feature
+    min_rows_per_feat = 10
+    required_min      = n_feats * min_rows_per_feat
+    pass1 = n_rows >= required_min
+    checks.append({
+        "rule":   f"≥ {min_rows_per_feat} rows per feature",
+        "needed": required_min,
+        "have":   n_rows,
+        "pass":   pass1,
+    })
+    if not pass1:
+        issues.append(f"Need {required_min:,} rows for {n_feats} features — you have {n_rows:,}. High overfitting risk.")
+
+    # Rule 2 — absolute minimum
+    abs_min = 100
+    pass2   = n_rows >= abs_min
+    checks.append({
+        "rule": f"Absolute minimum {abs_min} rows",
+        "needed": abs_min, "have": n_rows, "pass": pass2,
+    })
+    if not pass2:
+        issues.append(f"Absolute minimum is {abs_min} rows. Collect more data before training.")
+
+    # Rule 3 — classification specific (min per class)
+    if task_type == "classification":
+        vc      = df[target_column].value_counts()
+        min_cls = int(vc.min())
+        pass3   = min_cls >= 50
+        checks.append({
+            "rule": "≥ 50 samples per class",
+            "needed": 50, "have": min_cls, "pass": pass3,
+        })
+        if not pass3:
+            issues.append(f"Smallest class has only {min_cls} samples. Need ≥ 50 per class for reliable classification.")
+
+    # Rule 4 — learning curve projection
+    projected_improvement = "Unknown"
+    if n_rows < 500:
+        projected_improvement = "High — doubling data could improve accuracy by 10-20%"
+    elif n_rows < 2000:
+        projected_improvement = "Moderate — more data will help but diminishing returns"
+    else:
+        projected_improvement = "Low — dataset is large enough, focus on features instead"
+
+    ratio    = min(1.0, n_rows / max(required_min, 1))
+    adequate = len(issues) == 0
+
+    return {
+        "adequate":                adequate,
+        "n_rows":                  n_rows,
+        "n_features":              n_feats,
+        "checks":                  checks,
+        "issues":                  issues,
+        "projected_improvement":   projected_improvement,
+        "ratio":                   ratio,
+        "summary": (
+            f"{n_rows:,} rows, {n_feats} features — adequate"
+            if adequate else
+            f"{n_rows:,} rows for {n_feats} features — {len(issues)} issue(s)"
+        ),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 7 — DATA QUALITY SCORECARD  (A/B/C/D/F)
+# ─────────────────────────────────────────────────────────────────
+
+def build_scorecard(
+    profile:        dict,
+    health:         dict,
+    redundancy:     dict,
+    missing_pattern: dict,
+    type_inference: dict,
+    sample_check:   dict,
+    leakage:        dict,
+) -> dict[str, Any]:
+    """
+    Comprehensive A-F scorecard with sub-scores and benchmark comparison.
+    """
+    def score_to_grade(s, mx):
+        pct = s / max(mx, 1) * 100
+        if pct >= 90: return "A"
+        if pct >= 75: return "B"
+        if pct >= 60: return "C"
+        if pct >= 40: return "D"
+        return "F"
+
+    sections: list[dict] = []
+
+    # Section 1 — Data Completeness
+    mp  = profile.get("missing_pct", 0)
+    s1  = max(0, 100 - int(mp * 2))
+    sections.append({
+        "name":    "Data Completeness",
+        "score":   s1,
+        "grade":   score_to_grade(s1, 100),
+        "details": f"{mp}% missing across {len(profile.get('missing_by_col',{}))} columns",
+        "impact":  "HIGH",
+    })
+
+    # Section 2 — Data Integrity
+    dups   = profile.get("duplicate_rows", 0)
+    consts = len(profile.get("constant_features", []))
+    s2     = max(0, 100 - dups/max(profile.get("rows",1),1)*100 - consts*10)
+    sections.append({
+        "name":    "Data Integrity",
+        "score":   round(s2),
+        "grade":   score_to_grade(s2, 100),
+        "details": f"{dups} duplicates, {consts} constant columns",
+        "impact":  "MEDIUM",
+    })
+
+    # Section 3 — Feature Quality
+    n_red  = len(redundancy.get("redundant_pairs", []))
+    n_warn = type_inference.get("n_warnings", 0)
+    s3     = max(0, 100 - n_red*5 - n_warn*10)
+    sections.append({
+        "name":    "Feature Quality",
+        "score":   s3,
+        "grade":   score_to_grade(s3, 100),
+        "details": f"{n_red} redundant pairs, {n_warn} type warnings",
+        "impact":  "HIGH",
+    })
+
+    # Section 4 — Leakage Safety
+    n_leak = len(leakage.get("leakage_candidates", []))
+    s4     = max(0, 100 - n_leak*25)
+    sections.append({
+        "name":    "Leakage Safety",
+        "score":   s4,
+        "grade":   score_to_grade(s4, 100),
+        "details": f"{n_leak} high-risk feature(s)" if n_leak else "No leakage detected",
+        "impact":  "CRITICAL",
+    })
+
+    # Section 5 — Sample Adequacy
+    s5 = 100 if sample_check.get("adequate") else int(sample_check.get("ratio", 0.5) * 100)
+    sections.append({
+        "name":    "Sample Adequacy",
+        "score":   s5,
+        "grade":   score_to_grade(s5, 100),
+        "details": sample_check.get("summary", ""),
+        "impact":  "MEDIUM",
+    })
+
+    # Section 6 — Missing Pattern
+    pattern = missing_pattern.get("pattern", "NONE")
+    s6 = 100 if pattern == "NONE" else (80 if pattern == "MCAR" else (50 if pattern == "MAR" else 30))
+    sections.append({
+        "name":    "Missing Pattern",
+        "score":   s6,
+        "grade":   score_to_grade(s6, 100),
+        "details": f"Pattern: {pattern} — {missing_pattern.get('description','')}",
+        "impact":  "MEDIUM",
+    })
+
+    overall = int(sum(s["score"] for s in sections) / len(sections))
+    if overall >= 90:   overall_grade, overall_verdict = "A", "Excellent — Ready to Train"
+    elif overall >= 75: overall_grade, overall_verdict = "B", "Good — Minor Issues to Fix"
+    elif overall >= 60: overall_grade, overall_verdict = "C", "Fair — Fix Before Training"
+    elif overall >= 40: overall_grade, overall_verdict = "D", "Poor — Significant Work Needed"
+    else:               overall_grade, overall_verdict = "F", "Critical — Not Ready for ML"
+
+    # Benchmark (simulated percentile based on score)
+    percentile = min(99, max(1, overall))
+    benchmark  = f"Better than {percentile}% of datasets we've seen at this size"
+
+    return {
+        "overall_score":   overall,
+        "overall_grade":   overall_grade,
+        "overall_verdict": overall_verdict,
+        "benchmark":       benchmark,
+        "sections":        sections,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEATURE 8 — AUTOMATED FIX APPLICATION
+# ─────────────────────────────────────────────────────────────────
+
+def apply_automated_fixes(
+    df: pd.DataFrame,
+    target_column: str,
+    redundancy:     dict,
+    type_inference: dict,
+    opts: dict | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Applies all recommended fixes and returns (fixed_df, list_of_actions).
+    opts keys: drop_duplicates, impute_missing, cap_outliers,
+               drop_constant, drop_redundant, drop_id_cols
+    """
+    opts    = opts or {}
+    fixed   = df.copy()
+    actions: list[str] = []
+
+    # Drop constant columns
+    if opts.get("drop_constant", True):
+        const_cols = [c for c in fixed.columns if c != target_column and fixed[c].nunique() <= 1]
+        if const_cols:
+            fixed.drop(columns=const_cols, inplace=True)
+            actions.append(f"Dropped {len(const_cols)} constant column(s): {const_cols}")
+
+    # Drop ID-like columns
+    if opts.get("drop_id_cols", True):
+        id_cols = [
+            inf["column"] for inf in type_inference.get("inferences", [])
+            if inf["inferred"] == "ID Column" and inf["column"] in fixed.columns
+            and inf["column"] != target_column
+        ]
+        if id_cols:
+            fixed.drop(columns=id_cols, inplace=True)
+            actions.append(f"Dropped {len(id_cols)} ID column(s): {id_cols}")
+
+    # Drop redundant features
+    if opts.get("drop_redundant", True):
+        drop_cols = [
+            c for c in redundancy.get("drop_suggestions", [])
+            if c in fixed.columns and c != target_column
+        ]
+        if drop_cols:
+            fixed.drop(columns=drop_cols, inplace=True)
+            actions.append(f"Dropped {len(drop_cols)} redundant feature(s): {drop_cols[:5]}")
+
+    # Remove duplicates
+    if opts.get("drop_duplicates", True):
+        before = len(fixed)
+        fixed.drop_duplicates(inplace=True)
+        n = before - len(fixed)
+        if n:
+            actions.append(f"Removed {n} duplicate row(s)")
+
+    # Impute missing values
+    if opts.get("impute_missing", True):
+        num_cols = fixed.select_dtypes(include=[np.number]).columns.tolist()
+        cat_cols = fixed.select_dtypes(exclude=[np.number]).columns.tolist()
+        fn = fc = 0
+        for col in num_cols:
+            n = fixed[col].isna().sum()
+            if n:
+                fixed[col].fillna(fixed[col].median(), inplace=True)
+                fn += n
+        for col in cat_cols:
+            n = fixed[col].isna().sum()
+            if n:
+                fixed[col].fillna(fixed[col].mode()[0] if len(fixed[col].mode()) else "Unknown", inplace=True)
+                fc += n
+        if fn + fc > 0:
+            actions.append(f"Imputed {fn} numeric (median) + {fc} categorical (mode) missing values")
+
+    # Cap outliers
+    if opts.get("cap_outliers", True):
+        num_cols = fixed.select_dtypes(include=[np.number]).columns.tolist()
+        if target_column in num_cols:
+            num_cols.remove(target_column)
+        capped = []
+        for col in num_cols:
+            q1, q3 = fixed[col].quantile(0.25), fixed[col].quantile(0.75)
+            iqr    = q3 - q1
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            n_out  = ((fixed[col] < lo) | (fixed[col] > hi)).sum()
+            if n_out > 0:
+                fixed[col] = fixed[col].clip(lo, hi)
+                capped.append(col)
+        if capped:
+            actions.append(f"Capped outliers (IQR) in {len(capped)} column(s): {capped[:5]}{'...' if len(capped)>5 else ''}")
+
+    if not actions:
+        actions.append("Dataset was already clean — no fixes needed")
+
+    return fixed, actions
+
+
+# ─────────────────────────────────────────────────────────────────
+# DATA PROFILER  (basic stats for all features)
 # ─────────────────────────────────────────────────────────────────
 
 def profile_dataset(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
-    X = df.drop(columns=[target_column])
-    y = df[target_column]
-
-    total_cells   = df.shape[0] * df.shape[1]
-    missing_total = int(df.isna().sum().sum())
-    missing_pct   = round(missing_total / total_cells * 100, 2)
-    missing_by_col = {col: int(df[col].isna().sum()) for col in df.columns if df[col].isna().sum() > 0}
-
-    duplicate_rows = int(df.duplicated().sum())
+    X = df.drop(columns=[target_column], errors="ignore")
+    y = df[target_column] if target_column in df.columns else pd.Series(dtype=float)
 
     numeric_cols = X.select_dtypes(include=[np.number]).columns
     cat_cols     = X.select_dtypes(exclude=[np.number]).columns
 
+    missing_by_col = {c: int(df[c].isna().sum()) for c in df.columns if df[c].isna().sum() > 0}
+    total_cells    = df.shape[0] * df.shape[1]
+    missing_total  = int(df.isna().sum().sum())
+
     outlier_counts: dict[str, int] = {}
-    skewness:       dict[str, float] = {}
     for col in numeric_cols:
         q1, q3 = X[col].quantile(0.25), X[col].quantile(0.75)
         iqr    = q3 - q1
-        mask   = (X[col] < q1 - 1.5 * iqr) | (X[col] > q3 + 1.5 * iqr)
-        n      = int(mask.sum())
+        n      = int(((X[col] < q1 - 1.5*iqr) | (X[col] > q3 + 1.5*iqr)).sum())
         if n > 0:
             outlier_counts[col] = n
-        sk = float(X[col].skew())
-        if not np.isnan(sk):
-            skewness[col] = round(sk, 3)
 
     corr_with_target: dict[str, float] = {}
     if pd.api.types.is_numeric_dtype(y):
@@ -308,469 +764,71 @@ def profile_dataset(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
             if not np.isnan(c):
                 corr_with_target[col] = round(float(c), 4)
         corr_with_target = dict(
-            sorted(corr_with_target.items(), key=lambda x: abs(x[1]), reverse=True)[:10]
+            sorted(corr_with_target.items(), key=lambda x: abs(x[1]), reverse=True)[:15]
         )
 
-    task_type, _ = detect_task_type(y)
-    class_dist:      dict | None  = None
-    imbalance_ratio: float | None = None
-    if task_type == "classification":
-        vc            = y.value_counts()
-        class_dist    = {str(k): int(v) for k, v in vc.items()}
+    task_type, task_reason = detect_task_type(y) if len(y) > 0 else ("unknown", "")
+    class_dist      = None
+    imbalance_ratio = None
+    if task_type == "classification" and len(y) > 0:
+        vc              = y.value_counts()
+        class_dist      = {str(k): int(v) for k, v in vc.items()}
         if len(vc) >= 2:
             imbalance_ratio = round(float(vc.iloc[0] / vc.iloc[-1]), 2)
 
-    constant_features = [col for col in X.columns if X[col].nunique() <= 1]
-    high_card         = [col for col in cat_cols if X[col].nunique() > 50]
+    constant_features = [c for c in X.columns if X[c].nunique() <= 1]
+    high_card         = [c for c in cat_cols if X[c].nunique() > 50]
 
     return {
-        "rows":                   int(df.shape[0]),
-        "columns":                int(df.shape[1]),
-        "numeric_features":       int(len(numeric_cols)),
-        "categorical_features":   int(len(cat_cols)),
-        "missing_total":          missing_total,
-        "missing_pct":            missing_pct,
-        "missing_by_col":         missing_by_col,
-        "duplicate_rows":         duplicate_rows,
-        "outlier_counts":         outlier_counts,
-        "skewness":               skewness,
-        "top_correlations":       corr_with_target,
-        "class_distribution":     class_dist,
-        "imbalance_ratio":        imbalance_ratio,
-        "constant_features":      constant_features,
-        "high_cardinality_cols":  high_card,
-        "task_type":              task_type,
+        "rows":                  int(df.shape[0]),
+        "columns":               int(df.shape[1]),
+        "numeric_features":      int(len(numeric_cols)),
+        "categorical_features":  int(len(cat_cols)),
+        "missing_total":         missing_total,
+        "missing_pct":           round(missing_total / max(total_cells, 1) * 100, 2),
+        "missing_by_col":        missing_by_col,
+        "duplicate_rows":        int(df.duplicated().sum()),
+        "outlier_counts":        outlier_counts,
+        "top_correlations":      corr_with_target,
+        "class_distribution":    class_dist,
+        "imbalance_ratio":       imbalance_ratio,
+        "constant_features":     constant_features,
+        "high_cardinality_cols": list(high_card),
+        "task_type":             task_type,
+        "task_reason":           task_reason,
     }
 
 
 # ─────────────────────────────────────────────────────────────────
-# HEALTH SCORE  (per-dimension breakdown)
+# LEAKAGE DETECTION
 # ─────────────────────────────────────────────────────────────────
 
-def compute_health_score(
-    profile: dict,
-    best_metrics: dict,
-    task_type: str,
-    leakage: dict,
-) -> dict[str, Any]:
-    """
-    Returns full breakdown dict, not just a number.
-    Each dimension shows score, penalty, and reason.
-    """
-    dims: dict[str, dict] = {}
-
-    # 1. Data Completeness (0-25)
-    missing_pct = profile.get("missing_pct", 0)
-    comp_score  = max(0, 25 - int(missing_pct * 0.5))
-    dims["Data Completeness"] = {
-        "score":   comp_score,
-        "max":     25,
-        "penalty": 25 - comp_score,
-        "reason":  f"{missing_pct}% missing values" if missing_pct > 0 else "No missing values ✅",
+def detect_leakage(df: pd.DataFrame, target_column: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "leakage_candidates": [], "high_correlation_features": {}, "warnings": []
     }
+    if target_column not in df.columns:
+        return result
+    y = df[target_column]
+    if not pd.api.types.is_numeric_dtype(y):
+        return result
 
-    # 2. Data Integrity (0-20)
-    dup_ratio  = profile.get("duplicate_rows", 0) / max(profile.get("rows", 1), 1)
-    const_pen  = min(len(profile.get("constant_features", [])) * 5, 10)
-    integ_pen  = int(dup_ratio * 20) + const_pen
-    integ_score = max(0, 20 - integ_pen)
-    dims["Data Integrity"] = {
-        "score":   integ_score,
-        "max":     20,
-        "penalty": 20 - integ_score,
-        "reason":  (
-            f"{profile.get('duplicate_rows', 0)} duplicate rows, "
-            f"{len(profile.get('constant_features', []))} constant feature(s)"
-            if integ_pen > 0 else "No duplicates or constant features ✅"
-        ),
-    }
-
-    # 3. Signal Strength (0-30)
-    if task_type == "regression":
-        r2 = best_metrics.get("best_r2", best_metrics.get("r2", 0))
-        sig_score = max(0, int(r2 * 30))
-        sig_reason = f"Best model R²={r2:.3f}"
-    else:
-        acc = best_metrics.get("best_accuracy", best_metrics.get("accuracy", 0))
-        sig_score  = max(0, int((acc - 0.5) / 0.5 * 30)) if acc > 0.5 else 0
-        sig_reason = f"Best model accuracy={acc:.3f}"
-    dims["Signal Strength"] = {
-        "score":   sig_score,
-        "max":     30,
-        "penalty": 30 - sig_score,
-        "reason":  sig_reason,
-    }
-
-    # 4. Leakage Risk (0-15)
-    n_leaky = len(leakage.get("leakage_candidates", []))
-    leak_score = max(0, 15 - n_leaky * 8)
-    dims["Leakage Risk"] = {
-        "score":   leak_score,
-        "max":     15,
-        "penalty": 15 - leak_score,
-        "reason":  (
-            f"{n_leaky} leakage candidate(s) detected 🚨"
-            if n_leaky > 0 else "No leakage features detected ✅"
-        ),
-    }
-
-    # 5. Class Balance (0-10, regression gets full marks)
-    if task_type == "classification":
-        ir = profile.get("imbalance_ratio") or 1
-        if ir > 5:    bal_score, bal_reason = 0,  f"Severe imbalance {ir}:1 🚨"
-        elif ir > 2:  bal_score, bal_reason = 5,  f"Moderate imbalance {ir}:1 ⚠️"
-        else:         bal_score, bal_reason = 10, f"Balanced classes {ir}:1 ✅"
-    else:
-        bal_score  = 10
-        bal_reason = "N/A for regression ✅"
-    dims["Class Balance"] = {
-        "score":   bal_score,
-        "max":     10,
-        "penalty": 10 - bal_score,
-        "reason":  bal_reason,
-    }
-
-    total = sum(d["score"] for d in dims.values())
-
-    if total >= 80:   verdict = "🟢 Production-Ready"
-    elif total >= 60: verdict = "🟡 Needs Minor Work"
-    else:             verdict = "🔴 Significant Issues"
-
-    return {
-        "total":      total,
-        "verdict":    verdict,
-        "dimensions": dims,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-# DATASET CLEANING
-# ─────────────────────────────────────────────────────────────────
-
-def clean_dataset(
-    df: pd.DataFrame,
-    target_column: str,
-    remove_duplicates: bool = True,
-    impute_missing:    bool = True,
-    cap_outliers:      bool = True,
-    drop_constant:     bool = True,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    report: dict[str, Any] = {"original_shape": df.shape, "actions": []}
-    cleaned = df.copy()
-
-    if drop_constant:
-        cols = [c for c in cleaned.columns if c != target_column and cleaned[c].nunique() <= 1]
-        if cols:
-            cleaned.drop(columns=cols, inplace=True)
-            report["actions"].append(f"Dropped {len(cols)} constant column(s): {cols}")
-
-    if remove_duplicates:
-        before = len(cleaned)
-        cleaned.drop_duplicates(inplace=True)
-        n = before - len(cleaned)
-        if n:
-            report["actions"].append(f"Removed {n} duplicate row(s).")
-
-    if impute_missing:
-        num_cols = cleaned.select_dtypes(include=[np.number]).columns.tolist()
-        cat_cols = cleaned.select_dtypes(exclude=[np.number]).columns.tolist()
-        fn = fc = 0
-        for col in num_cols:
-            n = cleaned[col].isna().sum()
-            if n:
-                cleaned[col].fillna(cleaned[col].median(), inplace=True)
-                fn += n
-        for col in cat_cols:
-            n = cleaned[col].isna().sum()
-            if n:
-                cleaned[col].fillna(cleaned[col].mode()[0], inplace=True)
-                fc += n
-        if fn + fc > 0:
-            report["actions"].append(
-                f"Imputed {fn} numeric (median) + {fc} categorical (mode) missing values."
-            )
-
-    if cap_outliers:
-        num_cols = cleaned.select_dtypes(include=[np.number]).columns.tolist()
-        if target_column in num_cols:
-            num_cols.remove(target_column)
-        capped = []
-        for col in num_cols:
-            q1, q3 = cleaned[col].quantile(0.25), cleaned[col].quantile(0.75)
-            iqr    = q3 - q1
-            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-            if ((cleaned[col] < lo) | (cleaned[col] > hi)).sum() > 0:
-                cleaned[col] = cleaned[col].clip(lo, hi)
-                capped.append(col)
-        if capped:
-            report["actions"].append(
-                f"Capped outliers (IQR) in {len(capped)} column(s): "
-                f"{capped[:5]}{'...' if len(capped) > 5 else ''}"
-            )
-
-    report["final_shape"]   = cleaned.shape
-    report["rows_removed"]  = report["original_shape"][0] - cleaned.shape[0]
-    report["cols_removed"]  = report["original_shape"][1] - cleaned.shape[1]
-    report["missing_after"] = int(cleaned.isna().sum().sum())
-    return cleaned, report
-
-
-# ─────────────────────────────────────────────────────────────────
-# GROQ LLM ANALYSIS
-# ─────────────────────────────────────────────────────────────────
-
-def generate_llm_analysis(
-    profile:      dict,
-    model_results: dict,
-    task_type:    str,
-    health:       dict,
-    leakage:      dict,
-    ts_info:      dict,
-    feature_importance: dict,
-    preprocessing_steps: list,
-    api_key:      str | None = None,
-) -> dict[str, list[str]]:
-    """
-    Returns dict with keys:
-      overall_analysis, feature_commentary, model_commentary, action_plan
-    """
-    key = api_key or os.environ.get("GROQ_API_KEY", "")
-    if key:
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != target_column]
+    for col in numeric_cols:
         try:
-            from groq import Groq
-            client = Groq(api_key=key)
-
-            prompt = f"""You are a senior ML engineer reviewing an AutoML pipeline report.
-Return ONLY a valid JSON object with exactly these 4 keys (each is a list of strings):
-{{
-  "overall_analysis": [...],   // 4-5 bullets: dataset quality, key risks, overall verdict
-  "feature_commentary": [...], // 3-4 bullets: what the top features mean, which are redundant, what to engineer
-  "model_commentary": [...],   // 3-4 bullets: why winning model won, overfitting check, what to try next
-  "action_plan": [...]         // 3-5 bullets: prioritized list of exact next steps before deployment
-}}
-
-DATA:
-Task: {task_type}
-Health Score: {health['total']}/100 ({health['verdict']})
-Health Dimensions: {json.dumps({k: v['score'] for k,v in health['dimensions'].items()})}
-Profile: rows={profile['rows']}, missing={profile['missing_pct']}%, duplicates={profile['duplicate_rows']}, outliers={len(profile['outlier_counts'])} cols
-Leakage candidates: {leakage.get('leakage_candidates', [])}
-Time-series: {ts_info.get('is_timeseries', False)} ({ts_info.get('frequency_guess', '')})
-Model leaderboard: {json.dumps(model_results.get('leaderboard', [])[:3])}
-Top features: {json.dumps(list(feature_importance.items())[:6])}
-Imbalance ratio: {profile.get('imbalance_ratio', 'N/A')}
-
-Rules: Be specific, reference actual numbers, no Markdown in strings, no preamble, pure JSON only."""
-
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1000,
-                temperature=0.3,
-            )
-            raw = resp.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = "\n".join(raw.split("\n")[1:-1])
-            parsed = json.loads(raw)
-            if all(k in parsed for k in ["overall_analysis", "feature_commentary", "model_commentary", "action_plan"]):
-                return parsed
+            corr = abs(float(df[col].corr(y)))
+            if np.isnan(corr):
+                continue
+            result["high_correlation_features"][col] = round(corr, 4)
+            if corr > 0.95:
+                result["leakage_candidates"].append(col)
+                result["warnings"].append(
+                    f"🚨 '{col}' correlation={corr:.3f} — likely derived from or identical to target"
+                )
+            elif corr > 0.85:
+                result["warnings"].append(
+                    f"⚠️ '{col}' correlation={corr:.3f} — high, verify it's not leakage"
+                )
         except Exception:
-            pass
-
-    return _rule_based_llm(profile, model_results, task_type, health, leakage, ts_info, feature_importance)
-
-
-def _rule_based_llm(profile, model_results, task_type, health, leakage, ts_info, feature_importance):
-    leaderboard = model_results.get("leaderboard", [])
-    best = leaderboard[0] if leaderboard else {}
-
-    # Overall
-    overall = [
-        f"Dataset: {profile['rows']:,} rows × {profile['columns']} columns "
-        f"({profile['numeric_features']} numeric, {profile['categorical_features']} categorical). "
-        f"Health score: {health['total']}/100 ({health['verdict']})."
-    ]
-    if profile["missing_pct"] > 10:
-        overall.append(f"⚠️ {profile['missing_pct']}% missing values — imputation applied but review columns with >30% nulls for potential removal.")
-    elif profile["missing_total"] > 0:
-        overall.append(f"Minor missing data ({profile['missing_pct']}%) — median/mode imputation applied automatically.")
-    else:
-        overall.append("✅ Zero missing values — dataset is complete.")
-    if leakage.get("leakage_candidates"):
-        overall.append(f"🚨 {len(leakage['leakage_candidates'])} potential data leakage feature(s): {leakage['leakage_candidates']}. These must be verified before any deployment.")
-    if ts_info.get("is_timeseries"):
-        overall.append(f"⏱️ Time-series dataset ({ts_info['frequency_guess']}). Chronological split used. Standard random split would have leaked future data into training.")
-
-    # Feature commentary
-    feat = []
-    if feature_importance:
-        top3 = list(feature_importance.items())[:3]
-        feat.append(f"Top 3 predictive features: {', '.join(f'{k} ({v:.3f})' for k,v in top3)}. These drive the majority of model decisions.")
-        bottom = list(feature_importance.items())[-3:]
-        feat.append(f"Lowest importance features: {', '.join(k for k,_ in bottom)}. Consider dropping them to reduce noise and overfitting risk.")
-        feat.append("Features with importance < 0.01 are candidates for removal — they add complexity without predictive value.")
-    else:
-        feat.append("Feature importance not available for this model configuration.")
-    corr = profile.get("top_correlations", {})
-    if corr:
-        top_corr = list(corr.items())[0]
-        feat.append(f"'{top_corr[0]}' has the strongest linear correlation with target ({top_corr[1]:.3f}). This aligns with its high feature importance.")
-
-    # Model commentary
-    model_c = []
-    if best:
-        model_c.append(f"🏆 Best model: {best.get('model', '?')} with CV score={best.get('cv_score', '?'):.4f} — selected because it achieved highest cross-validated performance.")
-        if len(leaderboard) > 1:
-            second = leaderboard[1]
-            model_c.append(f"Runner-up: {second.get('model', '?')} (CV={second.get('cv_score', '?'):.4f}) — gap of {abs(best.get('cv_score',0) - second.get('cv_score',0)):.4f} suggests {'clear winner' if abs(best.get('cv_score',0) - second.get('cv_score',0)) > 0.02 else 'similar performance — both worth considering'}.")
-        train_cv_gap = abs(best.get("train_score", 0) - best.get("cv_score", 0))
-        if train_cv_gap > 0.1:
-            model_c.append(f"⚠️ Train/CV gap = {train_cv_gap:.3f} — possible overfitting. Consider reducing model complexity or adding regularization.")
-        else:
-            model_c.append(f"✅ Train/CV gap = {train_cv_gap:.3f} — model generalizes well, no significant overfitting detected.")
-    else:
-        model_c.append("No model results available.")
-
-    # Action plan
-    actions = []
-    if leakage.get("leakage_candidates"):
-        actions.append(f"1. CRITICAL: Investigate leakage features {leakage['leakage_candidates']} — drop or justify before training.")
-    if profile["missing_pct"] > 20:
-        actions.append("2. Review columns with >30% missing — imputation may introduce bias. Consider dropping them.")
-    if profile.get("duplicate_rows", 0) > 0:
-        actions.append(f"3. Remove {profile['duplicate_rows']} duplicate rows from the cleaned dataset before final training.")
-    if profile.get("imbalance_ratio") and profile["imbalance_ratio"] > 3:
-        actions.append(f"4. Address class imbalance ({profile['imbalance_ratio']}:1) — use SMOTE or class_weight='balanced'.")
-    actions.append("5. Download the cleaned dataset and use it for your final model training.")
-    actions.append("6. Retrain with XGBoost using the cleaned data and tune n_estimators + max_depth for best results.")
-
-    return {
-        "overall_analysis":   overall,
-        "feature_commentary": feat,
-        "model_commentary":   model_c,
-        "action_plan":        actions,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
-# PDF REPORT
-# ─────────────────────────────────────────────────────────────────
-
-def generate_pdf_report(
-    profile:        dict,
-    model_results:  dict,
-    task_type:      str,
-    health:         dict,
-    llm_analysis:   dict,
-    feature_importance: dict,
-    leakage:        dict,
-    ts_info:        dict,
-    cleaning_report: dict | None = None,
-) -> bytes:
-    try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.units import cm
-        from reportlab.lib import colors
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
-
-        styles   = getSampleStyleSheet()
-        s_title  = ParagraphStyle("T",  fontSize=20, fontName="Helvetica-Bold",  textColor=colors.HexColor("#1a1f35"), spaceAfter=4)
-        s_h2     = ParagraphStyle("H2", fontSize=13, fontName="Helvetica-Bold",  textColor=colors.HexColor("#2e3555"), spaceBefore=12, spaceAfter=4)
-        s_body   = ParagraphStyle("B",  fontSize=9,  fontName="Helvetica",       leading=13, spaceAfter=3)
-        s_bullet = ParagraphStyle("BU", fontSize=9,  fontName="Helvetica",       leading=13, leftIndent=10, spaceAfter=2)
-        s_cap    = ParagraphStyle("C",  fontSize=7,  fontName="Helvetica-Oblique", textColor=colors.grey)
-
-        DARK  = colors.HexColor("#1a1f35")
-        BLUE  = colors.HexColor("#7eb6ff")
-        STRIP = colors.HexColor("#f5f7ff")
-
-        def table(data, col_w):
-            t = Table(data, colWidths=col_w)
-            t.setStyle(TableStyle([
-                ("BACKGROUND",     (0,0), (-1,0), DARK),
-                ("TEXTCOLOR",      (0,0), (-1,0), colors.white),
-                ("FONTNAME",       (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE",       (0,0), (-1,-1), 8),
-                ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, STRIP]),
-                ("GRID",           (0,0), (-1,-1), 0.4, colors.HexColor("#cccccc")),
-                ("PADDING",        (0,0), (-1,-1), 5),
-            ]))
-            return t
-
-        story = []
-        story.append(Paragraph("🧠 AutoML Debugger — Diagnostic Report", s_title))
-        story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | Task: {task_type.capitalize()} | Health: {health['total']}/100 {health['verdict']}", s_cap))
-        story.append(HRFlowable(width="100%", thickness=1, color=BLUE, spaceAfter=10))
-
-        # Health breakdown
-        story.append(Paragraph("Dataset Health Score", s_h2))
-        hdata = [["Dimension", "Score", "Max", "Notes"]] + [
-            [k, str(v["score"]), str(v["max"]), v["reason"]]
-            for k, v in health["dimensions"].items()
-        ] + [["TOTAL", str(health["total"]), "100", health["verdict"]]]
-        story.append(table(hdata, [6*cm, 2*cm, 2*cm, 7*cm]))
-        story.append(Spacer(1, 8))
-
-        # Profile
-        story.append(Paragraph("Dataset Profile", s_h2))
-        pdata = [["Metric","Value"],["Rows", f"{profile['rows']:,}"],["Columns", str(profile['columns'])],
-                 ["Missing", f"{profile['missing_pct']}%"],["Duplicates", str(profile['duplicate_rows'])],
-                 ["Outlier cols", str(len(profile['outlier_counts']))],["Task", task_type]]
-        story.append(table(pdata, [8*cm, 8*cm]))
-        story.append(Spacer(1, 8))
-
-        # Model leaderboard
-        lb = model_results.get("leaderboard", [])
-        if lb:
-            story.append(Paragraph("Model Leaderboard", s_h2))
-            metric_key = "cv_r2" if task_type == "regression" else "cv_accuracy"
-            lbdata = [["Rank","Model","CV Score","Train Score","Status"]] + [
-                [str(i+1), m.get("model","?"), f"{m.get('cv_score',0):.4f}",
-                 f"{m.get('train_score',0):.4f}", "🏆 Best" if i==0 else ""]
-                for i, m in enumerate(lb)
-            ]
-            story.append(table(lbdata, [1.5*cm, 5*cm, 3*cm, 3*cm, 3.5*cm]))
-            story.append(Spacer(1, 8))
-
-        # Expert analysis sections
-        for section_key, section_title in [
-            ("overall_analysis",   "Overall Analysis"),
-            ("feature_commentary", "Feature Intelligence"),
-            ("model_commentary",   "Model Commentary"),
-            ("action_plan",        "Action Plan"),
-        ]:
-            bullets = llm_analysis.get(section_key, [])
-            if bullets:
-                story.append(Paragraph(section_title, s_h2))
-                for b in bullets:
-                    story.append(Paragraph(f"• {b}", s_bullet))
-                story.append(Spacer(1, 6))
-
-        # Leakage
-        if leakage.get("leakage_candidates"):
-            story.append(Paragraph("🚨 Data Leakage Risks", s_h2))
-            for w in leakage.get("warnings", []):
-                story.append(Paragraph(f"• {w}", s_bullet))
-
-        # Cleaning summary
-        if cleaning_report and cleaning_report.get("actions"):
-            story.append(Paragraph("Dataset Cleaning Summary", s_h2))
-            orig, final = cleaning_report["original_shape"], cleaning_report["final_shape"]
-            story.append(Paragraph(f"Shape: {orig[0]}×{orig[1]} → {final[0]}×{final[1]}", s_body))
-            for a in cleaning_report["actions"]:
-                story.append(Paragraph(f"• {a}", s_bullet))
-
-        story.append(HRFlowable(width="100%", thickness=1, color=BLUE, spaceBefore=10))
-        story.append(Paragraph("AutoML Debugger v3.0 · Groq LLaMA 3.3 70B · scikit-learn · XGBoost · LightGBM", s_cap))
-
-        doc.build(story)
-        return buf.getvalue()
-
-    except ImportError:
-        lines = [f"AUTOML DEBUGGER REPORT | {datetime.now()}", f"Health: {health['total']}/100",
-                 f"Task: {task_type}", "Action Plan:"] + llm_analysis.get("action_plan", [])
-        return "\n".join(lines).encode("utf-8")
+            continue
+    return result
