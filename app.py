@@ -36,6 +36,9 @@ from src.debugger_engine import (
     analyze_outlier_root_cause,
     simulate_data_drift,
     generate_problem_framings,
+    # Milestone 3
+    build_feature_engineering_roadmap,
+    compare_datasets,
 )
 from src.report_generator import generate_groq_report, generate_pdf
 
@@ -44,8 +47,8 @@ FALLBACK = Path("data/initial_dataset.csv")
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
-PAGES = ["Upload", "Audit", "Deep Analysis", "Intelligence", "Scorecard", "Report"]
-ICONS = ["📁", "🔍", "🧬", "🧠", "📊", "📄"]
+PAGES = ["Upload", "Audit", "Deep Analysis", "Intelligence", "FE Roadmap", "Compare", "Scorecard", "Report"]
+ICONS = ["📁", "🔍", "🧬", "🧠", "⚙️", "🔄", "📊", "📄"]
 
 defaults = {
     "page": 0,
@@ -77,6 +80,10 @@ defaults = {
     "drift_sim": {},
     "problem_framings": [],
     "m2_done": False,
+    # Milestone 3
+    "fe_roadmap": {},
+    "comparison_result": {},
+    "m3_fe_done": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -169,7 +176,9 @@ completed = {
     2: S["analysis_done"],
     3: S["m2_done"],
     4: S["m2_done"],
-    5: S["report_done"],
+    5: S["df"] is not None,   # Compare always accessible
+    6: S["m2_done"],
+    7: S["report_done"],
 }
 
 # ─────────────────────────────────────────────
@@ -285,13 +294,15 @@ if cur == 0:
     if df is not None:
         S["df"] = df
         # Reset downstream state when new file uploaded
-        for k in ["analysis_done","report_done","m2_done","fixed_df","fix_actions",
+        for k in ["analysis_done","report_done","m2_done","m3_fe_done","fixed_df","fix_actions",
                   "report_sections","pdf_bytes","leakage_prob","outlier_rca",
-                  "drift_sim","problem_framings"]:
-            if k in ["analysis_done","report_done","m2_done"]:
+                  "drift_sim","problem_framings","fe_roadmap","comparison_result"]:
+            if k in ["analysis_done","report_done","m2_done","m3_fe_done"]:
                 S[k] = False
-            elif k in ["fixed_df","pdf_bytes","leakage_prob","outlier_rca","drift_sim"]:
+            elif k in ["fixed_df","pdf_bytes"]:
                 S[k] = None
+            elif k in ["leakage_prob","outlier_rca","drift_sim","fe_roadmap","comparison_result"]:
+                S[k] = {}
             else:
                 S[k] = []
 
@@ -1117,13 +1128,268 @@ elif cur == 3:
     st.markdown("<br>", unsafe_allow_html=True)
     c1, c2 = st.columns([1,5])
     c1.button("← Deep Analysis", on_click=lambda: go_to(2))
-    c2.button("View Scorecard →", type="primary", on_click=lambda: go_to(4))
+    c2.button("Feature Engineering Roadmap →", type="primary", on_click=lambda: go_to(4))
 
 
 # ══════════════════════════════════════════════
-# PAGE 4 — SCORECARD
+# PAGE 4 — FEATURE ENGINEERING ROADMAP
 # ══════════════════════════════════════════════
 elif cur == 4:
+    if not S["analysis_done"]:
+        st.warning("Run the audit first.")
+        st.button("← Go to Audit", on_click=lambda: go_to(1))
+        st.stop()
+
+    st.markdown("## ⚙️ Feature Engineering Roadmap")
+
+    if not S["m3_fe_done"]:
+        with st.spinner("Building feature engineering roadmap..."):
+            S["fe_roadmap"] = build_feature_engineering_roadmap(
+                df=S["df"],
+                target_column=S["target_column"],
+                task_type=S["task_type"],
+                profile=S["profile"],
+                distributions=S["distributions"],
+                redundancy=S["redundancy"],
+                type_inference=S["type_inference"],
+                leakage=S["leakage"],
+            )
+            S["m3_fe_done"] = True
+
+    fe = S["fe_roadmap"]
+
+    # Summary banner
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, str(len(fe.get("phase1", []))), "Phase 1 Actions")
+    kpi(k2, str(len(fe.get("phase2", []))), "Phase 2 Actions")
+    kpi(k3, str(len(fe.get("phase3", []))), "Phase 3 Actions")
+    kpi(k4, str(fe.get("n_total", 0)), "Total Improvements")
+
+    st.markdown(
+        f'<div class="card card-blue" style="margin:12px 0;padding:10px 14px;font-size:0.87rem">' +
+        f'{fe.get("summary","")}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Phase colors
+    phase_styles = {
+        "phase1": ("#22c55e", "#052e16", "Phase 1 — Quick Wins", "~30 minutes · High ROI"),
+        "phase2": ("#f59e0b", "#1c1400", "Phase 2 — Moderate Effort", "2-4 hours · Medium ROI"),
+        "phase3": ("#3b82f6", "#0c1a3a", "Phase 3 — Advanced", "1+ days · High potential"),
+    }
+
+    for phase_key, (color, bg, title, effort) in phase_styles.items():
+        items = fe.get(phase_key, [])
+        if not items:
+            continue
+
+        st.markdown(
+            f'<div style="margin:16px 0 8px">' +
+            f'<span style="color:{color};font-size:1rem;font-weight:700">{title}</span>' +
+            f'<span style="color:#334155;font-size:0.78rem;margin-left:10px">{effort}</span>' +
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        for item in items:
+            cols_str = str(item.get("columns", ""))[:60] if item.get("columns") else "Multiple"
+            st.markdown(
+                f'<div style="background:{bg};border:1px solid {color}30;' +
+                f'border-left:4px solid {color};border-radius:8px;' +
+                f'padding:12px 16px;margin-bottom:8px">' +
+                f'<div style="display:flex;justify-content:space-between;align-items:flex-start">' +
+                f'<div style="flex:1">' +
+                f'<div style="font-size:0.92rem;font-weight:700;color:#e2e8f0;margin-bottom:3px">{item.get("action","")}</div>' +
+                f'<div style="font-size:0.8rem;color:#64748b;margin-bottom:4px">Columns: {cols_str}</div>' +
+                f'<div style="font-size:0.82rem;color:#94a3b8;margin-bottom:6px">{item.get("reason","")}</div>' +
+                f'<div style="font-size:0.8rem;color:{color}">Expected: {item.get("expected_impact","")}</div>' +
+                f'</div>' +
+                f'<div style="text-align:right;margin-left:12px">' +
+                f'<span style="background:{color}20;color:{color};border:1px solid {color}40;' +
+                f'padding:2px 8px;border-radius:8px;font-size:0.75rem;font-weight:600">{item.get("effort","")}</span>' +
+                f'</div></div>' +
+                f'<div style="background:#0a0e1a;border-radius:5px;padding:8px 10px;margin-top:8px">' +
+                f'<code style="font-size:0.78rem;color:#60a5fa;white-space:pre-wrap">{item.get("code","")}</code>' +
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns([1, 5])
+    c1.button("← Intelligence", on_click=lambda: go_to(3))
+    c2.button("Dataset Comparison →", type="primary", on_click=lambda: go_to(5))
+
+
+# ══════════════════════════════════════════════
+# PAGE 5 — DATASET COMPARISON
+# ══════════════════════════════════════════════
+elif cur == 5:
+    st.markdown("## 🔄 Dataset Comparison")
+    st.markdown(
+        '<div style="color:#475569;font-size:0.88rem;margin-bottom:16px">' +
+        'Upload a second version of your dataset to compare distributions, schema, and drift.</div>',
+        unsafe_allow_html=True,
+    )
+
+    df_base = S["df"]
+    if df_base is None:
+        st.warning("Upload a base dataset on the Upload page first.")
+        st.button("← Go to Upload", on_click=lambda: go_to(0))
+        st.stop()
+
+    st.markdown(f'**Base dataset:** {df_base.shape[0]:,} rows × {df_base.shape[1]} columns')
+
+    uploaded_compare = st.file_uploader(
+        "Upload second dataset (new version or production data)",
+        type=["csv"], key="compare_upload",
+    )
+
+    if uploaded_compare:
+        try:
+            df_new = pd.read_csv(uploaded_compare)
+            st.success(f"New dataset loaded — {df_new.shape[0]:,} rows × {df_new.shape[1]} columns")
+
+            if st.button("🔄 Run Comparison", type="primary"):
+                with st.spinner("Comparing datasets..."):
+                    S["comparison_result"] = compare_datasets(
+                        df_base, df_new, S["target_column"]
+                    )
+
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+
+    comp = S.get("comparison_result", {})
+    if comp:
+        verdict = comp.get("verdict", "")
+        risk    = comp.get("risk", "LOW")
+        vcls    = "card-red" if risk=="HIGH" else ("card-amber" if risk=="MEDIUM" else "card-green")
+        vcol    = "#ef4444" if risk=="HIGH" else ("#f59e0b" if risk=="MEDIUM" else "#22c55e")
+
+        st.markdown(
+            f'<div class="card {vcls}" style="padding:12px 16px;margin:12px 0">' +
+            f'<span style="color:{vcol};font-weight:700;font-size:0.95rem">{verdict}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+        if comp.get("critical_issues"):
+            for issue in comp["critical_issues"]:
+                st.markdown(
+                    f'<div class="card card-red" style="padding:8px 12px;font-size:0.85rem;margin-bottom:5px">🚨 {issue}</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # KPIs
+        rows = comp.get("rows", {})
+        schema = comp.get("schema", {})
+        k1, k2, k3, k4, k5 = st.columns(5)
+        kpi(k1, f"{rows.get('old',0):,}", "Base Rows")
+        kpi(k2, f"{rows.get('new',0):,}", "New Rows")
+        delta = rows.get("delta", 0)
+        kpi(k3, f"{'+' if delta>=0 else ''}{delta:,}", "Row Delta")
+        kpi(k4, str(len(schema.get("added", []))), "Cols Added")
+        kpi(k5, str(len(schema.get("removed", []))), "Cols Removed")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        tab_a, tab_b, tab_c = st.tabs(["📐 Schema & Rows", "📊 Distribution Shifts", "🎯 Target Shift"])
+
+        with tab_a:
+            section_title("Schema Changes")
+            if schema.get("added"):
+                st.markdown(f'<div class="card card-green" style="padding:8px 12px;font-size:0.85rem">✅ New columns added: <b>{schema["added"]}</b></div>', unsafe_allow_html=True)
+            if schema.get("removed"):
+                st.markdown(f'<div class="card card-red" style="padding:8px 12px;font-size:0.85rem">🔴 Columns removed: <b>{schema["removed"]}</b></div>', unsafe_allow_html=True)
+            if not schema.get("added") and not schema.get("removed"):
+                st.success("✅ Schema is identical — no columns added or removed.")
+
+            missing_changes = comp.get("missing_changes", [])
+            if missing_changes:
+                section_title("Missing Value Changes")
+                mc_df = pd.DataFrame(missing_changes)
+                st.dataframe(mc_df, use_container_width=True, hide_index=True)
+
+        with tab_b:
+            shifts = comp.get("distribution_shifts", [])
+            if shifts:
+                n_shifted = comp.get("n_shifted", 0)
+                st.markdown(
+                    f'<div class="card" style="padding:9px 13px;font-size:0.87rem;margin-bottom:10px">' +
+                    f'<b>{n_shifted}</b> of <b>{len(shifts)}</b> features show statistically significant distribution shift (p &lt; 0.05)</div>',
+                    unsafe_allow_html=True,
+                )
+                sh_df = pd.DataFrame([{
+                    "Feature":     r["column"],
+                    "KS Stat":     r["ks_stat"],
+                    "p-value":     r["p_value"],
+                    "Shifted":     "🔴 YES" if r["shifted"] else "🟢 NO",
+                    "Severity":    r["severity"],
+                    "Mean (Base)": r["mean_old"],
+                    "Mean (New)":  r["mean_new"],
+                    "Shift %":     r["mean_shift"],
+                } for r in shifts])
+                st.dataframe(sh_df, use_container_width=True, hide_index=True)
+
+                fig = px.bar(
+                    sh_df.sort_values("KS Stat"),
+                    x="KS Stat", y="Feature", orientation="h",
+                    color="KS Stat", color_continuous_scale="RdYlGn_r",
+                    template="plotly_dark",
+                    title="Distribution Shift (KS Statistic) per Feature",
+                )
+                fig.add_vline(x=0.3, line_dash="dash", line_color="#ef4444")
+                fig.add_vline(x=0.15, line_dash="dash", line_color="#f59e0b")
+                fig.update_layout(paper_bgcolor="#0a0e1a", plot_bgcolor="#111827",
+                                  coloraxis_showscale=False, margin=dict(t=30))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No numeric features to compare.")
+
+        with tab_c:
+            td = comp.get("target_shift")
+            if td:
+                ts_col = "#ef4444" if td["shifted"] else "#22c55e"
+                ts_cls = "card-red" if td["shifted"] else "card-green"
+                st.markdown(
+                    f'<div class="card {ts_cls}" style="padding:12px 16px">' +
+                    f'<div style="font-size:0.95rem;font-weight:700;color:{ts_col}">' +
+                    f'{"🔴 Target Distribution Shifted" if td["shifted"] else "✅ Target Distribution Stable"}</div>' +
+                    f'<div style="font-size:0.85rem;color:#64748b;margin-top:6px">' +
+                    f'KS Stat: {td["ks_stat"]} · p-value: {td["p_value"]} · Severity: {td["severity"]}</div>' +
+                    f'<div style="font-size:0.85rem;color:#94a3b8;margin-top:4px">' +
+                    f'Base mean: {td["mean_old"]} → New mean: {td["mean_new"]}</div>' +
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if td["shifted"]:
+                    st.markdown(
+                        '<div class="card card-amber" style="padding:9px 13px;font-size:0.85rem;margin-top:8px">' +
+                        '⚠️ The target variable distribution has changed between datasets. ' +
+                        'A model trained on the base dataset may underperform on the new data. ' +
+                        'Consider retraining on the combined or newer dataset.</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("Target column not found in both datasets or non-numeric target.")
+    else:
+        st.markdown(
+            '<div class="card" style="text-align:center;padding:40px;color:#1e2d45">' +
+            '<div style="font-size:2rem">🔄</div>' +
+            '<div style="margin-top:10px">Upload a second CSV to compare against your base dataset</div>' +
+            '<div style="font-size:0.82rem;color:#334155;margin-top:6px">' +
+            'Use cases: current vs previous version · training data vs production · A/B dataset comparison</div>' +
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    c1, c2 = st.columns([1, 5])
+    c1.button("← FE Roadmap", on_click=lambda: go_to(4))
+    c2.button("View Scorecard →", type="primary", on_click=lambda: go_to(6))
+
+
+# ══════════════════════════════════════════════
+# PAGE 6 — SCORECARD
+# ══════════════════════════════════════════════
+elif cur == 6:
     if not S["analysis_done"]:
         st.warning("Run the audit first.")
         st.button("← Go to Audit", on_click=lambda: go_to(1))
@@ -1208,14 +1474,14 @@ elif cur == 4:
 
     st.markdown("<br>", unsafe_allow_html=True)
     c1, c2 = st.columns([1,5])
-    c1.button("← Intelligence", on_click=lambda: go_to(3))
-    c2.button("Generate Expert Report →", type="primary", on_click=lambda: go_to(5))
+    c1.button("← Compare", on_click=lambda: go_to(5))
+    c2.button("Generate Expert Report →", type="primary", on_click=lambda: go_to(7))
 
 
 # ══════════════════════════════════════════════
 # PAGE 4 — REPORT
 # ══════════════════════════════════════════════
-elif cur == 5:
+elif cur == 7:
     if not S["analysis_done"]:
         st.warning("Run the audit first.")
         st.button("← Go to Audit", on_click=lambda: go_to(1))
@@ -1239,6 +1505,10 @@ elif cur == 5:
                 ts_info=S["ts_info"],
                 target_column=S["target_column"],
                 task_type=S["task_type"],
+                leakage_prob=S.get("leakage_prob") or None,
+                outlier_rca=S.get("outlier_rca") or None,
+                drift_sim=S.get("drift_sim") or None,
+                fe_roadmap=S.get("fe_roadmap") or None,
                 api_key=S["api_key"] or None,
             )
             S["pdf_bytes"] = generate_pdf(
@@ -1254,6 +1524,9 @@ elif cur == 5:
                 target_column=S["target_column"],
                 task_type=S["task_type"],
                 fix_actions=S["fix_actions"],
+                fe_roadmap=S.get("fe_roadmap") or None,
+                leakage_prob=S.get("leakage_prob") or None,
+                drift_sim=S.get("drift_sim") or None,
             )
             S["report_done"] = True
             st.rerun()
@@ -1313,7 +1586,7 @@ elif cur == 5:
             )
 
     c1, c2 = st.columns([1,5])
-    c1.button("← Scorecard", on_click=lambda: go_to(4))
+    c1.button("← Scorecard", on_click=lambda: go_to(6))
     if c2.button("🔄 Regenerate Report"):
         S["report_done"] = False
         st.rerun()
