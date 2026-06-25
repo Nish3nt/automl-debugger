@@ -1,16 +1,20 @@
 """
-AutoML Debugger — Professional Report Generator  (Milestone 1 v4.0)
+AutoML Debugger — Professional Report Generator  (Milestone 3 v4.0)
 ====================================================================
-Groq writes each section as real paragraphs — not bullet points.
-Sections:
-  1. Executive Summary        (for managers)
-  2. Dataset Quality Analysis (for engineers)
-  3. Risk Assessment          (for compliance)
-  4. Feature Analysis         (for data scientists)
-  5. Recommended Next Steps   (for project planning)
-  6. Model Recommendations    (which model family to use and why)
+Feature 15: Multi-Section Groq Report
 
-PDF is structured like a professional audit document.
+6 sections, each written as real professional paragraphs for a
+specific audience — not bullet points, not templates.
+
+  1. Executive Summary        — for managers (plain English, verdict)
+  2. Dataset Quality Analysis — for ML engineers (technical detail)
+  3. Risk Assessment          — for compliance (what can go wrong)
+  4. Feature Analysis         — for data scientists (what to transform)
+  5. Recommended Next Steps   — for project planning (exact actions)
+  6. Model Recommendations    — for the team (which algorithm, why)
+
+PDF is structured as a professional audit document with cover page,
+scorecard table, Groq sections, and data tables.
 """
 
 from __future__ import annotations
@@ -23,89 +27,82 @@ from typing import Any
 
 
 # ─────────────────────────────────────────────────────────────────
-# GROQ REPORT WRITER
+# GROQ MULTI-SECTION REPORT WRITER
 # ─────────────────────────────────────────────────────────────────
 
 def generate_groq_report(
-    profile:         dict,
-    health:          dict,
-    scorecard:       dict,
-    leakage:         dict,
-    redundancy:      dict,
-    missing_pattern: dict,
-    distributions:   dict,
-    type_inference:  dict,
-    sample_check:    dict,
-    ts_info:         dict,
-    target_column:   str,
-    task_type:       str,
-    api_key:         str | None = None,
+    profile:          dict,
+    health:           dict,
+    scorecard:        dict,
+    leakage:          dict,
+    redundancy:       dict,
+    missing_pattern:  dict,
+    distributions:    dict,
+    type_inference:   dict,
+    sample_check:     dict,
+    ts_info:          dict,
+    target_column:    str,
+    task_type:        str,
+    leakage_prob:     dict | None = None,
+    outlier_rca:      dict | None = None,
+    drift_sim:        dict | None = None,
+    fe_roadmap:       dict | None = None,
+    api_key:          str | None = None,
 ) -> dict[str, str]:
-    """
-    Returns dict with section_name -> paragraph text.
-    Falls back to rule-based text if no API key.
-    """
     key = api_key or os.environ.get("GROQ_API_KEY", "")
 
+    # Build rich context for Groq
     context = {
         "dataset": {
-            "rows":       profile.get("rows", 0),
-            "columns":    profile.get("columns", 0),
-            "numeric":    profile.get("numeric_features", 0),
-            "categorical":profile.get("categorical_features", 0),
-            "missing_pct":profile.get("missing_pct", 0),
-            "duplicates": profile.get("duplicate_rows", 0),
-            "target":     target_column,
-            "task":       task_type,
+            "rows":         profile.get("rows", 0),
+            "columns":      profile.get("columns", 0),
+            "numeric":      profile.get("numeric_features", 0),
+            "categorical":  profile.get("categorical_features", 0),
+            "missing_pct":  profile.get("missing_pct", 0),
+            "duplicates":   profile.get("duplicate_rows", 0),
+            "target":       target_column,
+            "task":         task_type,
         },
-        "health": {
-            "total":   health.get("total", 0),
-            "grade":   health.get("grade", "?"),
-            "verdict": health.get("verdict", ""),
-            "dims":    {k: v["score"] for k, v in health.get("dimensions", {}).items()},
+        "quality": {
+            "grade":      scorecard.get("overall_grade", "?"),
+            "score":      scorecard.get("overall_score", 0),
+            "verdict":    scorecard.get("overall_verdict", ""),
+            "health":     health.get("total", 0),
+            "dimensions": {k: {"score": v["score"], "reason": v["reason"]}
+                           for k, v in health.get("dimensions", {}).items()},
         },
-        "scorecard": {
-            "overall":  scorecard.get("overall_score", 0),
-            "grade":    scorecard.get("overall_grade", "?"),
-            "verdict":  scorecard.get("overall_verdict", ""),
-            "sections": [{
-                "name":  s["name"],
-                "score": s["score"],
-                "grade": s["grade"],
-            } for s in scorecard.get("sections", [])],
+        "risks": {
+            "leakage_candidates": leakage.get("leakage_candidates", []),
+            "leakage_prob_critical": (leakage_prob or {}).get("n_critical", 0),
+            "leakage_prob_high":     (leakage_prob or {}).get("n_high", 0),
+            "timeseries":            ts_info.get("is_timeseries", False),
+            "ts_frequency":          ts_info.get("frequency_guess", ""),
+            "drift_risk":            (drift_sim or {}).get("risk", "UNKNOWN"),
+            "drift_pct":             (drift_sim or {}).get("drift_pct", 0),
+            "sample_issues":         sample_check.get("issues", []),
+            "imbalance_ratio":       profile.get("imbalance_ratio"),
         },
-        "leakage": {
-            "candidates": leakage.get("leakage_candidates", []),
-            "n_high_corr": len([v for v in leakage.get("high_correlation_features", {}).values() if v > 0.85]),
-        },
-        "redundancy": {
-            "n_pairs":       len(redundancy.get("redundant_pairs", [])),
+        "features": {
+            "redundant_pairs":  len(redundancy.get("redundant_pairs", [])),
             "drop_suggestions": redundancy.get("drop_suggestions", []),
-            "top_vif":       sorted(redundancy.get("vif_scores", {}).items(), key=lambda x: x[1], reverse=True)[:3],
+            "skewed_features":  [k for k, v in distributions.items()
+                                 if abs(v.get("skewness", 0)) > 1.5][:5],
+            "type_warnings":    type_inference.get("warnings", []),
+            "top_correlations": list(profile.get("top_correlations", {}).keys())[:5],
+            "outlier_drivers":  (outlier_rca or {}).get("major_drivers", []),
+            "outlier_pct":      (outlier_rca or {}).get("pct_outliers", 0),
+        },
+        "next_steps": {
+            "phase1_count": len((fe_roadmap or {}).get("phase1", [])),
+            "phase2_count": len((fe_roadmap or {}).get("phase2", [])),
+            "phase3_count": len((fe_roadmap or {}).get("phase3", [])),
+            "phase1_actions": [(s["action"]) for s in (fe_roadmap or {}).get("phase1", [])][:3],
+            "phase2_actions": [(s["action"]) for s in (fe_roadmap or {}).get("phase2", [])][:3],
         },
         "missing": {
             "pattern":        missing_pattern.get("pattern", "NONE"),
             "recommendation": missing_pattern.get("recommendation", ""),
             "total_pct":      missing_pattern.get("total_missing_pct", 0),
-        },
-        "sample": {
-            "adequate": sample_check.get("adequate", True),
-            "issues":   sample_check.get("issues", []),
-            "projected_improvement": sample_check.get("projected_improvement", ""),
-        },
-        "timeseries": {
-            "detected":  ts_info.get("is_timeseries", False),
-            "frequency": ts_info.get("frequency_guess", ""),
-            "column":    ts_info.get("datetime_column", ""),
-        },
-        "distributions": {
-            "highly_skewed": [
-                col for col, d in distributions.items() if abs(d.get("skewness", 0)) > 1.5
-            ][:5],
-            "non_normal": [
-                col for col, d in distributions.items()
-                if not d.get("is_normal", True) and d.get("p_normal") is not None
-            ][:5],
         },
     }
 
@@ -114,41 +111,38 @@ def generate_groq_report(
             from groq import Groq
             client = Groq(api_key=key)
 
-            prompt = f"""You are a senior ML engineer writing a professional dataset audit report.
+            prompt = f"""You are a senior ML engineer writing a professional ML dataset audit report for a client.
 
-Based on the analysis data below, write 6 sections of a professional report.
-Each section should be 3-5 sentences written as flowing professional prose (NOT bullet points).
-Be specific — reference actual numbers from the data.
-Write as if you're a consultant presenting findings to a client.
+Write 6 sections as flowing professional prose — NOT bullet points, NOT headers within sections.
+Each section targets a DIFFERENT audience. Be specific — reference actual numbers and column names.
+Write 3-5 sentences per section. Sound like a consultant, not a chatbot.
 
-Return ONLY a valid JSON object with exactly these 6 keys, each containing a string:
+Return ONLY a valid JSON object with exactly these 6 string keys:
 {{
-  "executive_summary": "...",
-  "dataset_quality_analysis": "...",
-  "risk_assessment": "...",
-  "feature_analysis": "...",
-  "recommended_next_steps": "...",
-  "model_recommendations": "..."
+  "executive_summary": "For non-technical managers. State the grade, headline risk, and one-line recommendation.",
+  "dataset_quality_analysis": "For ML engineers. Cover missing data pattern, duplicates, outlier rate, integrity issues with exact numbers.",
+  "risk_assessment": "For compliance/legal. Cover leakage risk, drift risk, time-series risk, and consequences of ignoring them.",
+  "feature_analysis": "For data scientists. Cover redundancy, skewness, multicollinearity (VIF), top predictors, and what to transform.",
+  "recommended_next_steps": "For project managers. Exact prioritised actions with effort estimates. Reference the 3-phase roadmap.",
+  "model_recommendations": "For the engineering team. Which algorithm, why, what hyperparameters to tune first, what to avoid."
 }}
 
 ANALYSIS DATA:
 {json.dumps(context, indent=2)}
 
-Section guidelines:
-- executive_summary: High-level verdict for a non-technical manager. Mention the grade, key strength, and biggest concern.
-- dataset_quality_analysis: Technical details for an ML engineer. Cover missing data pattern, duplicates, outliers, and data integrity.
-- risk_assessment: Focus on leakage risks, time-series risks, class imbalance risks. Be direct about consequences.
-- feature_analysis: Discuss redundancy, VIF scores, skewed distributions, and which features need transformation.
-- recommended_next_steps: Exact prioritized actions. Be concrete — "Drop column X", "Apply log transform to Y", etc.
-- model_recommendations: Based on the data profile, which model family to use and why. Mention specific algorithms.
-
-Rules: Professional tone. No markdown formatting inside strings. No bullet points. Pure flowing prose. Reference actual numbers."""
+Rules:
+- Reference exact numbers (rows, columns, percentages, correlation values)
+- Mention specific column names where relevant
+- No markdown formatting inside strings
+- No bullet points or numbered lists
+- Each section must be a single paragraph of flowing prose
+- Sound authoritative and expert, not generic"""
 
             resp = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.4,
+                max_tokens=2500,
+                temperature=0.35,
             )
             raw = resp.choices[0].message.content.strip()
             if raw.startswith("```"):
@@ -157,7 +151,7 @@ Rules: Professional tone. No markdown formatting inside strings. No bullet point
             required = ["executive_summary", "dataset_quality_analysis", "risk_assessment",
                         "feature_analysis", "recommended_next_steps", "model_recommendations"]
             if all(k in parsed for k in required):
-                return parsed
+                return {k: parsed[k] for k in required}
         except Exception:
             pass
 
@@ -166,63 +160,69 @@ Rules: Professional tone. No markdown formatting inside strings. No bullet point
 
 def _rule_based_report(ctx: dict) -> dict[str, str]:
     ds  = ctx["dataset"]
-    h   = ctx["health"]
-    sc  = ctx["scorecard"]
-    lk  = ctx["leakage"]
-    rd  = ctx["redundancy"]
+    q   = ctx["quality"]
+    r   = ctx["risks"]
+    f   = ctx["features"]
+    ns  = ctx["next_steps"]
     ms  = ctx["missing"]
-    sa  = ctx["sample"]
-    ts  = ctx["timeseries"]
-    di  = ctx["distributions"]
 
+    leakage_note = ("No data leakage was detected, which is a positive signal for model validity. "
+                     if not r["leakage_candidates"] else
+                     ("The most critical finding is " + str(len(r["leakage_candidates"])) +
+                      " potential leakage feature(s) which must be investigated immediately before any model training begins. "))
+    rec_note = ("proceeding with the feature engineering roadmap outlined below before training"
+                if q["score"] >= 60 else
+                "resolving the critical data quality issues identified in this report before attempting any model training")
     exec_summary = (
-        f"This dataset contains {ds['rows']:,} rows and {ds['columns']} columns targeting "
-        f"'{ds['target']}' for a {ds['task']} task. "
-        f"The overall data quality grade is {sc['grade']} ({sc['overall']}%) — {sc['verdict']}. "
-        f"The health score of {h['total']}/100 reflects "
-        f"{'strong data quality with minor issues to address' if h['total'] >= 75 else 'significant data quality issues that must be resolved before training'}. "
-        + ("No data leakage was detected, which is a positive indicator." if not lk["candidates"] else ("Critical attention is required for " + str(len(lk["candidates"])) + " potential leakage feature(s)."))
+        f"This dataset comprising {ds['rows']:,} rows and {ds['columns']} columns "
+        f"targeting '{ds['target']}' for a {ds['task']} task has received a Data Quality Grade of "
+        f"{q['grade']} ({q['score']}/100). "
+        f"The health score of {q['health']}/100 reflects "
+        f"{'strong data foundations with addressable issues' if q['health'] >= 70 else 'material data quality problems requiring resolution before training'}. "
+        + leakage_note
+        + f"We recommend {rec_note}."
     )
 
     quality_analysis = (
-        f"The dataset has {ds['missing_pct']}% missing values following a {ms['pattern']} pattern — "
+        f"The dataset contains {ds['missing_pct']}% missing values following a {ms['pattern']} pattern — "
         f"{ms['recommendation']} "
-        f"There are {ds['duplicates']} duplicate rows which should be removed before training. "
-        f"{'Outlier analysis reveals skewed distributions in several features requiring transformation. ' if di['highly_skewed'] else 'Feature distributions are generally well-behaved. '}"
-        f"The {ds['numeric']} numeric and {ds['categorical']} categorical features provide "
-        f"{'a rich diverse feature set' if ds['numeric'] + ds['categorical'] > 10 else 'a compact feature set'}."
+        f"There are {ds['duplicates']} duplicate rows which represent wasted compute and potential bias if not removed. "
+        f"{'Outlier analysis using Mahalanobis distance detected ' + str(ctx.get('features',{}).get('outlier_pct',0)) + '% multivariate outliers, driven primarily by ' + str(f.get('outlier_drivers',['unknown'])[:2]) + '.' if f.get('outlier_pct', 0) > 0 else 'No significant multivariate outliers were detected.'} "
+        f"The {ds['numeric']} numeric and {ds['categorical']} categorical features present "
+        f"{'significant redundancy with ' + str(f['redundant_pairs']) + ' highly correlated pairs identified' if f['redundant_pairs'] > 0 else 'acceptable feature diversity with no major redundancy concerns'}."
     )
 
     risk_assessment = (
-        f"{'CRITICAL: ' + str(len(lk['candidates'])) + ' feature(s) show correlation >0.95 with the target, indicating high leakage risk: ' + str(lk['candidates']) + '. ' if lk['candidates'] else 'No data leakage risk detected — all feature correlations are within safe bounds. '}"
-        f"{'This is a time-series dataset with ' + ts['frequency'] + ' frequency. Using a random train/test split would leak future information into training — chronological splitting is mandatory. ' if ts['detected'] else ''}"
-        f"{'Sample size adequacy check found issues: ' + '; '.join(sa['issues']) if sa['issues'] else 'Sample size is adequate for the number of features. '}"
-        f"Overall risk level is {'HIGH' if lk['candidates'] else ('MEDIUM' if sa['issues'] else 'LOW')}."
+        f"{'CRITICAL RISK: ' + str(len(r['leakage_candidates'])) + ' feature(s) show correlation above 0.95 with the target, indicating near-certain data leakage: ' + str(r['leakage_candidates']) + '. Deploying a model trained on this data would produce fraudulently inflated metrics that collapse in production. ' if r['leakage_candidates'] else 'No data leakage was detected — feature correlations are within safe bounds. '}"
+        f"{'Temporal drift analysis reveals ' + str(r['drift_pct']) + '% of features shift significantly between the first and second halves of this dataset, presenting a ' + r['drift_risk'] + ' deployment risk as production data will differ from training data. ' if r['drift_risk'] != 'UNKNOWN' else ''}"
+        f"{'This is a time-series dataset with ' + r['ts_frequency'] + ' frequency. Using a random train/test split would constitute a methodological error by allowing future data to inform past predictions. ' if r['timeseries'] else ''}"
+        f"{'Sample size adequacy check raised the following concern: ' + r['sample_issues'][0] if r['sample_issues'] else 'Sample size is adequate for the feature count.'}"
     )
 
     feature_analysis = (
-        f"Feature redundancy analysis identified {rd['n_pairs']} highly correlated feature pairs. "
-        f"{'Suggested drops: ' + str(rd['drop_suggestions'][:3]) + ' to reduce multicollinearity. ' if rd['drop_suggestions'] else 'No critical redundancy detected. '}"
-        f"{'The following features show high skewness and would benefit from log transformation: ' + str(di['highly_skewed']) + '. ' if di['highly_skewed'] else 'Feature distributions are generally symmetric. '}"
-        f"{'Features with high VIF scores indicate multicollinearity that may destabilize linear models. ' if rd.get('top_vif') else ''}"
-        f"Correlation analysis with the target column reveals the most predictive features."
+        f"Feature redundancy analysis identified {f['redundant_pairs']} highly correlated pairs — "
+        f"{'recommended drops include: ' + str(f['drop_suggestions'][:3]) + ', which carry near-duplicate information. ' if f['drop_suggestions'] else 'no critical redundancy requiring immediate action. '}"
+        f"{'The following features show high skewness requiring log transformation before training with linear models: ' + str(f['skewed_features'][:3]) + '. ' if f['skewed_features'] else 'Feature distributions are generally well-behaved. '}"
+        f"{'Smart column type inference flagged: ' + '; '.join(f['type_warnings'][:2]) + '. ' if f['type_warnings'] else 'No column type issues detected. '}"
+        f"The top predictors by correlation with '{ds['target']}' are: {f['top_correlations'][:4]}, which should be prioritised in any feature selection or engineering work."
     )
 
     next_steps = (
-        f"{'FIRST: Remove leakage features ' + str(lk['candidates']) + ' before any training. ' if lk['candidates'] else ''}"
-        f"{'Drop redundant features: ' + str(rd['drop_suggestions'][:3]) + '. ' if rd['drop_suggestions'] else ''}"
-        f"{'Apply log1p transform to skewed features: ' + str(di['highly_skewed'][:3]) + '. ' if di['highly_skewed'] else ''}"
-        f"Remove {ds['duplicates']} duplicate rows using the cleaned dataset download. "
-        f"{'Use chronological train/test split — do NOT use random splitting on this time-series data. ' if ts['detected'] else 'Use stratified random split for train/test separation. '}"
-        f"Download the automated fixed dataset from the Export section as your starting point."
+        f"The feature engineering roadmap identifies {ns['phase1_count'] + ns['phase2_count'] + ns['phase3_count']} total improvements across three phases. "
+        f"Phase 1 (Quick Wins, ~30 minutes): {', '.join(ns['phase1_actions'][:3]) if ns['phase1_actions'] else 'clean and encode basics'}. "
+        f"Phase 2 (Moderate effort, 2-4 hours): {', '.join(ns['phase2_actions'][:2]) if ns['phase2_actions'] else 'engineer interactions and handle categoricals'}. "
+        f"Phase 3 (Advanced, 1+ days): polynomial features, lag features, and external data enrichment. "
+        f"{'FIRST ACTION: Remove the identified leakage feature(s) ' + str(r['leakage_candidates']) + ' before any other work. ' if r['leakage_candidates'] else ''}"
+        f"Download the automated cleaned dataset from the Export section as your starting point."
     )
 
     model_rec = (
         f"Based on this {ds['task']} task with {ds['rows']:,} rows and {ds['numeric']} numeric features: "
-        f"{'XGBoost or LightGBM are strongly recommended — they handle the mixed numeric/categorical features natively, are robust to outliers, and do not require scaling. ' if ds['numeric'] > 5 else 'Ridge Regression is appropriate for this small feature set and will generalize well with proper regularization. '}"
-        f"{'For time-series data, use TimeSeriesSplit cross-validation and consider lag features. ' if ts['detected'] else ''}"
-        f"{'With significant class imbalance, use class_weight=\"balanced\" parameter. ' if ctx.get('imbalance_ratio', 1) > 3 else ''}"
-        f"Start with default hyperparameters and tune only n_estimators and max_depth in a second iteration."
+        f"{'XGBoost or LightGBM are the recommended starting point — they handle mixed feature types natively, are robust to the outliers and skewness identified in this dataset, and require minimal preprocessing. ' if ds['numeric'] > 5 else 'Ridge Regression is appropriate for this compact numeric feature set and will generalize reliably with proper L2 regularisation. '}"
+        f"{'For time-series data, use TimeSeriesSplit cross-validation with at least 5 folds — never random splitting. Consider adding lag features from the roadmap before training. ' if r['timeseries'] else 'Use stratified k-fold cross-validation (5 folds) for reliable performance estimates. '}"
+        f"Tune n_estimators (100-500) and max_depth (3-7) first as these have the highest impact, and only proceed to learning_rate tuning after establishing a good tree structure. "
+        + "Always compare against a naive baseline (mean predictor for regression, "
+          "majority class for classification) to ensure the model delivers genuine value."
     )
 
     return {
@@ -240,18 +240,21 @@ def _rule_based_report(ctx: dict) -> dict[str, str]:
 # ─────────────────────────────────────────────────────────────────
 
 def generate_pdf(
-    report_sections: dict[str, str],
-    profile:         dict,
-    health:          dict,
-    scorecard:       dict,
-    leakage:         dict,
-    redundancy:      dict,
-    missing_pattern: dict,
-    sample_check:    dict,
-    type_inference:  dict,
-    target_column:   str,
-    task_type:       str,
-    fix_actions:     list[str],
+    report_sections:  dict[str, str],
+    profile:          dict,
+    health:           dict,
+    scorecard:        dict,
+    leakage:          dict,
+    redundancy:       dict,
+    missing_pattern:  dict,
+    sample_check:     dict,
+    type_inference:   dict,
+    target_column:    str,
+    task_type:        str,
+    fix_actions:      list[str],
+    fe_roadmap:       dict | None = None,
+    leakage_prob:     dict | None = None,
+    drift_sim:        dict | None = None,
 ) -> bytes:
     try:
         from reportlab.lib.pagesizes import A4
@@ -270,8 +273,7 @@ def generate_pdf(
             topMargin=2*cm,    bottomMargin=2*cm,
         )
 
-        # ── Styles ────────────────────────────────────────────────
-        NAVY  = colors.HexColor("#1a2035")
+        NAVY  = colors.HexColor("#0f172a")
         BLUE  = colors.HexColor("#2563eb")
         LGRAY = colors.HexColor("#f1f5f9")
         MGRAY = colors.HexColor("#94a3b8")
@@ -280,30 +282,35 @@ def generate_pdf(
         RED   = colors.HexColor("#dc2626")
 
         grade_color = {
-            "A": GREEN, "B": colors.HexColor("#22c55e"),
-            "C": AMBER,  "D": colors.HexColor("#ea580c"),
+            "A": GREEN,
+            "B": colors.HexColor("#22c55e"),
+            "C": AMBER,
+            "D": colors.HexColor("#ea580c"),
             "F": RED,
         }
 
-        s_cover_title = ParagraphStyle("CT", fontSize=26, fontName="Helvetica-Bold",
-                                        textColor=NAVY, spaceAfter=6)
-        s_cover_sub   = ParagraphStyle("CS", fontSize=12, fontName="Helvetica",
-                                        textColor=MGRAY, spaceAfter=4)
-        s_h1          = ParagraphStyle("H1", fontSize=16, fontName="Helvetica-Bold",
-                                        textColor=NAVY, spaceBefore=16, spaceAfter=6)
-        s_h2          = ParagraphStyle("H2", fontSize=12, fontName="Helvetica-Bold",
-                                        textColor=BLUE, spaceBefore=10, spaceAfter=4)
-        s_body        = ParagraphStyle("BD", fontSize=9.5, fontName="Helvetica",
-                                        leading=15, spaceAfter=6, textColor=colors.HexColor("#334155"))
-        s_caption     = ParagraphStyle("CA", fontSize=7.5, fontName="Helvetica-Oblique",
-                                        textColor=MGRAY, spaceAfter=2)
-        s_label       = ParagraphStyle("LB", fontSize=8, fontName="Helvetica-Bold",
-                                        textColor=MGRAY, spaceAfter=2)
+        s_title  = ParagraphStyle("T",  fontSize=24, fontName="Helvetica-Bold",
+                                   textColor=NAVY, spaceAfter=4)
+        s_sub    = ParagraphStyle("S",  fontSize=11, fontName="Helvetica",
+                                   textColor=MGRAY, spaceAfter=4)
+        s_h1     = ParagraphStyle("H1", fontSize=15, fontName="Helvetica-Bold",
+                                   textColor=NAVY, spaceBefore=16, spaceAfter=5)
+        s_h2     = ParagraphStyle("H2", fontSize=11, fontName="Helvetica-Bold",
+                                   textColor=BLUE, spaceBefore=10, spaceAfter=4)
+        s_body   = ParagraphStyle("BD", fontSize=9.5, fontName="Helvetica",
+                                   leading=15, spaceAfter=6,
+                                   textColor=colors.HexColor("#334155"))
+        s_code   = ParagraphStyle("CD", fontSize=8, fontName="Courier",
+                                   leading=12, spaceAfter=4,
+                                   textColor=colors.HexColor("#1e40af"),
+                                   backColor=colors.HexColor("#f0f4ff"))
+        s_cap    = ParagraphStyle("CA", fontSize=7.5, fontName="Helvetica-Oblique",
+                                   textColor=MGRAY, spaceAfter=2)
 
-        def make_table(data, col_widths, header_bg=NAVY):
-            t = Table(data, colWidths=col_widths)
+        def tbl(data, widths, hdr_bg=NAVY):
+            t = Table(data, colWidths=widths)
             t.setStyle(TableStyle([
-                ("BACKGROUND",     (0,0), (-1,0), header_bg),
+                ("BACKGROUND",     (0,0), (-1,0), hdr_bg),
                 ("TEXTCOLOR",      (0,0), (-1,0), colors.white),
                 ("FONTNAME",       (0,0), (-1,0), "Helvetica-Bold"),
                 ("FONTSIZE",       (0,0), (-1,-1), 8.5),
@@ -323,79 +330,86 @@ def generate_pdf(
             "model_recommendations":    "Model Recommendations",
         }
 
+        SECTION_AUDIENCE = {
+            "executive_summary":        "For: Management",
+            "dataset_quality_analysis": "For: ML Engineers",
+            "risk_assessment":          "For: Compliance",
+            "feature_analysis":         "For: Data Scientists",
+            "recommended_next_steps":   "For: Project Managers",
+            "model_recommendations":    "For: Engineering Team",
+        }
+
         story = []
 
         # ── COVER PAGE ────────────────────────────────────────────
-        story.append(Spacer(1, 1.5*cm))
-        story.append(Paragraph("AutoML Debugger", s_cover_sub))
-        story.append(Paragraph("ML Dataset Audit Report", s_cover_title))
-        story.append(Spacer(1, 0.3*cm))
+        story.append(Spacer(1, 1.2*cm))
+        story.append(Paragraph("AutoML Debugger", s_sub))
+        story.append(Paragraph("ML Dataset Audit Report", s_title))
         story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=14))
 
-        grade    = scorecard.get("overall_grade", "?")
-        gc       = grade_color.get(grade, NAVY)
-        gen_time = datetime.now().strftime("%B %d, %Y  %H:%M")
+        grade  = scorecard.get("overall_grade", "?")
+        gc     = grade_color.get(grade, NAVY)
+        now_str = datetime.now().strftime("%B %d, %Y  %H:%M")
 
-        meta_data = [
-            ["Target Column",  target_column,     "Task Type",   task_type.capitalize()],
-            ["Dataset Size",   f"{profile.get('rows',0):,} rows × {profile.get('columns',0)} cols",
-             "Generated",      gen_time],
-            ["Overall Grade",  grade,              "Overall Score", f"{scorecard.get('overall_score',0)}/100"],
-            ["Verdict",        scorecard.get("overall_verdict",""), "Health Score", f"{health.get('total',0)}/100"],
+        meta = [
+            ["Target Column",  target_column,
+             "Task Type",      task_type.capitalize()],
+            ["Dataset Size",   f"{profile.get('rows',0):,} rows x {profile.get('columns',0)} cols",
+             "Generated",      now_str],
+            ["Overall Grade",  grade,
+             "Score",          f"{scorecard.get('overall_score',0)}/100"],
+            ["Health Score",   f"{health.get('total',0)}/100",
+             "Verdict",        scorecard.get("overall_verdict","")],
         ]
-        mt = Table(meta_data, colWidths=[4*cm, 5.5*cm, 4*cm, 3.5*cm])
+        mt = Table(meta, colWidths=[4*cm, 5*cm, 3.5*cm, 4.5*cm])
         mt.setStyle(TableStyle([
-            ("FONTSIZE",  (0,0), (-1,-1), 8.5),
-            ("FONTNAME",  (0,0), (-1,-1), "Helvetica"),
-            ("FONTNAME",  (0,0), (0,-1), "Helvetica-Bold"),
-            ("FONTNAME",  (2,0), (2,-1), "Helvetica-Bold"),
-            ("TEXTCOLOR", (0,0), (0,-1), NAVY),
-            ("TEXTCOLOR", (2,0), (2,-1), NAVY),
+            ("FONTSIZE",       (0,0), (-1,-1), 8.5),
+            ("FONTNAME",       (0,0), (0,-1), "Helvetica-Bold"),
+            ("FONTNAME",       (2,0), (2,-1), "Helvetica-Bold"),
+            ("TEXTCOLOR",      (0,0), (0,-1), NAVY),
+            ("TEXTCOLOR",      (2,0), (2,-1), NAVY),
             ("ROWBACKGROUNDS", (0,0), (-1,-1), [colors.white, LGRAY]),
-            ("GRID",      (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
-            ("PADDING",   (0,0), (-1,-1), 7),
+            ("GRID",           (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
+            ("PADDING",        (0,0), (-1,-1), 7),
         ]))
         story.append(mt)
         story.append(Spacer(1, 0.5*cm))
 
-        # Grade badge - no em-dash to avoid ReportLab rendering issues
-        verdict_text = scorecard.get("overall_verdict", "").replace("—", "-")
         gc_hex = gc.hexval()[2:]
         story.append(Paragraph(
             f'<font size="13" color="#{gc_hex}"><b>Data Quality Grade: {grade}</b></font>',
             s_body,
         ))
+        verdict_clean = scorecard.get("overall_verdict","").replace("\u2014", "-")
         story.append(Paragraph(
-            f'<font size="11" color="#{gc_hex}">{verdict_text}</font>',
+            f'<font size="11" color="#{gc_hex}">{verdict_clean}</font>',
             s_body,
         ))
-        story.append(Paragraph(scorecard.get("benchmark", ""), s_caption))
-        story.append(Spacer(1, 0.8*cm))
+        story.append(Paragraph(scorecard.get("benchmark",""), s_cap))
+        story.append(Spacer(1, 0.6*cm))
         story.append(PageBreak())
 
-        # ── SCORECARD TABLE ───────────────────────────────────────
+        # ── SCORECARD ─────────────────────────────────────────────
         story.append(Paragraph("Data Quality Scorecard", s_h1))
         sc_data = [["Section", "Score", "Grade", "Impact", "Details"]]
         for sec in scorecard.get("sections", []):
-            g    = sec["grade"]
-            gcol = grade_color.get(g, NAVY)
             sc_data.append([
                 sec["name"],
                 f"{sec['score']}/100",
                 sec["grade"],
-                sec.get("impact", ""),
-                sec.get("details", "")[:60],
+                sec.get("impact",""),
+                sec.get("details","")[:55],
             ])
-        story.append(make_table(sc_data, [4.5*cm, 2*cm, 1.5*cm, 2*cm, 7*cm]))
+        story.append(tbl(sc_data, [4.5*cm, 2*cm, 1.5*cm, 2*cm, 7*cm]))
         story.append(Spacer(1, 0.4*cm))
 
-        # Health score breakdown
+        # Health breakdown
         story.append(Paragraph("Health Score Breakdown", s_h2))
-        hd_data = [["Dimension", "Score", "Max", "Notes"]]
+        hd = [["Dimension", "Score", "Max", "Notes"]]
         for dim, dv in health.get("dimensions", {}).items():
-            hd_data.append([dim, str(dv["score"]), str(dv["max"]), dv.get("reason", "")])
-        hd_data.append(["TOTAL", str(health.get("total",0)), "100", health.get("verdict","")])
-        story.append(make_table(hd_data, [5*cm, 2*cm, 2*cm, 8*cm]))
+            hd.append([dim, str(dv["score"]), str(dv["max"]), dv.get("reason","")[:60]])
+        hd.append(["TOTAL", str(health.get("total",0)), "100", health.get("verdict","")])
+        story.append(tbl(hd, [5*cm, 2*cm, 2*cm, 8*cm]))
         story.append(PageBreak())
 
         # ── GROQ REPORT SECTIONS ──────────────────────────────────
@@ -404,87 +418,129 @@ def generate_pdf(
             if not text:
                 continue
             story.append(Paragraph(title, s_h1))
-            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e2e8f0"), spaceAfter=8))
+            story.append(Paragraph(SECTION_AUDIENCE[key_name], s_cap))
+            story.append(HRFlowable(width="100%", thickness=0.5,
+                                     color=colors.HexColor("#e2e8f0"), spaceAfter=8))
             story.append(Paragraph(text, s_body))
-            story.append(Spacer(1, 0.3*cm))
+            story.append(Spacer(1, 0.2*cm))
 
         story.append(PageBreak())
 
-        # ── DATA PROFILE TABLE ────────────────────────────────────
+        # ── DATA TABLES ───────────────────────────────────────────
         story.append(Paragraph("Dataset Profile", s_h1))
-        prof_data = [
+        prof = [
             ["Metric", "Value", "Metric", "Value"],
-            ["Total Rows",    f"{profile.get('rows',0):,}",
-             "Numeric Features", str(profile.get('numeric_features',0))],
-            ["Total Columns", str(profile.get('columns',0)),
-             "Categorical Features", str(profile.get('categorical_features',0))],
-            ["Missing Values", f"{profile.get('missing_pct',0)}%",
-             "Duplicate Rows", str(profile.get('duplicate_rows',0))],
+            ["Rows",             f"{profile.get('rows',0):,}",
+             "Numeric Features",  str(profile.get('numeric_features',0))],
+            ["Columns",          str(profile.get('columns',0)),
+             "Categorical",       str(profile.get('categorical_features',0))],
+            ["Missing Values",   f"{profile.get('missing_pct',0)}%",
+             "Duplicates",        str(profile.get('duplicate_rows',0))],
             ["Constant Features", str(len(profile.get('constant_features',[]))),
-             "High-Cardinality Cols", str(len(profile.get('high_cardinality_cols',[])))],
-            ["Outlier Columns", str(len(profile.get('outlier_counts',{}))),
-             "Leakage Candidates", str(len(leakage.get('leakage_candidates',[])))],
+             "High-Card Cols",    str(len(profile.get('high_cardinality_cols',[])))],
+            ["Leakage Candidates", str(len(leakage.get('leakage_candidates',[]))),
+             "Redundant Pairs",   str(len(redundancy.get('redundant_pairs',[])))],
         ]
-        story.append(make_table(prof_data, [4.5*cm, 4*cm, 4.5*cm, 4*cm]))
+        story.append(tbl(prof, [4.5*cm, 4*cm, 4.5*cm, 4*cm]))
         story.append(Spacer(1, 0.4*cm))
 
         # Missing pattern
         story.append(Paragraph("Missing Value Pattern", s_h2))
-        mp = missing_pattern
-        mp_data = [
+        mp_d = [
             ["Pattern", "Total Missing %", "Recommendation"],
-            [mp.get("pattern","NONE"), f"{mp.get('total_missing_pct',0)}%", mp.get("recommendation","")[:80]],
+            [missing_pattern.get("pattern","NONE"),
+             f"{missing_pattern.get('total_missing_pct',0)}%",
+             missing_pattern.get("recommendation","")[:80]],
         ]
-        story.append(make_table(mp_data, [3*cm, 4*cm, 10*cm]))
+        story.append(tbl(mp_d, [3*cm, 4*cm, 10*cm]))
         story.append(Spacer(1, 0.4*cm))
 
         # Redundant pairs
         red_pairs = redundancy.get("redundant_pairs", [])
         if red_pairs:
-            story.append(Paragraph("Feature Redundancy", s_h2))
-            rp_data = [["Feature 1", "Feature 2", "Correlation", "Severity"]]
-            for p in red_pairs[:10]:
-                rp_data.append([
-                    p["feature_1"], p["feature_2"],
-                    str(p["correlation"]), p["severity"],
-                ])
-            story.append(make_table(rp_data, [4.5*cm, 4.5*cm, 3*cm, 5*cm]))
+            story.append(Paragraph("Top Redundant Feature Pairs", s_h2))
+            rp = [["Feature 1","Feature 2","Correlation","Severity"]]
+            for p in red_pairs[:8]:
+                rp.append([p["feature_1"], p["feature_2"],
+                            str(p["correlation"]), p["severity"]])
+            story.append(tbl(rp, [4.5*cm, 4.5*cm, 3*cm, 5*cm]))
             story.append(Spacer(1, 0.4*cm))
+
+        # Leakage probability
+        if leakage_prob and leakage_prob.get("features"):
+            story.append(Paragraph("Leakage Probability Scores (Top 10)", s_h2))
+            lp_d = [["Feature","MI Score","Correlation","Leakage Prob","Risk"]]
+            for col, v in list(leakage_prob["features"].items())[:10]:
+                lp_d.append([col, str(v["mi_score"]), str(v["correlation"]),
+                              str(v["leakage_prob"]), v["risk_level"]])
+            story.append(tbl(lp_d, [4*cm, 2.5*cm, 3*cm, 3*cm, 4.5*cm]))
+            story.append(Spacer(1, 0.4*cm))
+
+        # Drift simulation
+        if drift_sim and drift_sim.get("available"):
+            story.append(Paragraph("Data Drift Simulation (First vs Second Half)", s_h2))
+            dr_top = drift_sim.get("drift_results", [])[:8]
+            if dr_top:
+                dr_d = [["Feature","KS Stat","Drifted","Severity","Mean Shift %"]]
+                for r in dr_top:
+                    dr_d.append([r["feature"], str(r["ks_stat"]),
+                                  "YES" if r["drifted"] else "NO",
+                                  r["severity"], f"{r['mean_shift']}%"])
+                story.append(tbl(dr_d, [4*cm, 2.5*cm, 2*cm, 3*cm, 3*cm]))
+                story.append(Spacer(1, 0.4*cm))
+
+        # Feature Engineering Roadmap
+        if fe_roadmap:
+            story.append(Paragraph("Feature Engineering Roadmap", s_h2))
+            for phase_key, phase_label in [
+                ("phase1","Phase 1 - Quick Wins (~30 min)"),
+                ("phase2","Phase 2 - Moderate Effort (2-4 hours)"),
+                ("phase3","Phase 3 - Advanced (1+ days)"),
+            ]:
+                items = fe_roadmap.get(phase_key, [])
+                if not items:
+                    continue
+                story.append(Paragraph(phase_label, s_cap))
+                ph_d = [["Action","Columns","Expected Impact","Code"]]
+                for item in items:
+                    cols_str = str(item.get("columns",""))[:30]
+                    code_str = item.get("code","").split("\n")[0][:40]
+                    ph_d.append([
+                        item.get("action","")[:40],
+                        cols_str,
+                        item.get("expected_impact","")[:40],
+                        code_str,
+                    ])
+                story.append(tbl(ph_d, [4.5*cm, 3.5*cm, 4*cm, 5*cm]))
+                story.append(Spacer(1, 0.2*cm))
+            story.append(Spacer(1, 0.2*cm))
 
         # Sample size checks
         checks = sample_check.get("checks", [])
         if checks:
             story.append(Paragraph("Sample Size Adequacy", s_h2))
-            ch_data = [["Rule", "Needed", "Have", "Status"]]
+            ch = [["Rule","Needed","Have","Status"]]
             for c in checks:
-                ch_data.append([
-                    c["rule"],
-                    str(c["needed"]),
-                    str(c["have"]),
-                    "✅ Pass" if c["pass"] else "❌ Fail",
-                ])
-            story.append(make_table(ch_data, [7*cm, 3*cm, 3*cm, 4*cm]))
+                ch.append([c["rule"], str(c["needed"]), str(c["have"]),
+                            "Pass" if c["pass"] else "FAIL"])
+            story.append(tbl(ch, [7*cm, 3*cm, 3*cm, 4*cm]))
             story.append(Spacer(1, 0.4*cm))
 
-        # Automated fixes applied
+        # Automated fixes
         if fix_actions:
             story.append(Paragraph("Automated Fixes Applied to Cleaned Dataset", s_h2))
-            fx_data = [["#", "Action"]]
+            fx = [["#","Action"]]
             for i, a in enumerate(fix_actions, 1):
-                fx_data.append([str(i), a])
-            story.append(make_table(fx_data, [1.5*cm, 15.5*cm]))
-
-        # ── FOOTER ────────────────────────────────────────────────
-        story.append(Spacer(1, 1*cm))
-        story.append(HRFlowable(width="100%", thickness=0.5, color=MGRAY))
-        story.append(Paragraph(
-            f"AutoML Debugger v4.0 · Milestone 1 · Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
-            f"Powered by Groq LLaMA 3.3 70B · Built with Streamlit",
-            s_caption,
-        ))
+                fx.append([str(i), a])
+            story.append(tbl(fx, [1.5*cm, 15.5*cm]))
 
         doc.build(story)
         return buf.getvalue()
 
     except ImportError:
-        return f"AUTOML DEBUGGER REPORT\nGenerated: {datetime.now()}\nGrade: {scorecard.get('overall_grade','?')}\n".encode()
+        return (
+            f"AUTOML DEBUGGER AUDIT REPORT\n"
+            f"Generated: {datetime.now()}\n"
+            f"Grade: {scorecard.get('overall_grade','?')}\n"
+            f"Score: {scorecard.get('overall_score',0)}/100\n"
+        ).encode()
