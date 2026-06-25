@@ -239,6 +239,7 @@ def _rule_based_report(ctx: dict) -> dict[str, str]:
 # PDF GENERATOR — Professional Audit Document
 # ─────────────────────────────────────────────────────────────────
 
+
 def generate_pdf(
     report_sections:  dict[str, str],
     profile:          dict,
@@ -258,20 +259,23 @@ def generate_pdf(
 ) -> bytes:
     try:
         from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.lib import colors
         from reportlab.platypus import (
             SimpleDocTemplate, Paragraph, Spacer,
             Table, TableStyle, HRFlowable, PageBreak,
+            Frame, PageTemplate, BaseDocTemplate,
         )
+        from reportlab.platypus.tableofcontents import TableOfContents
 
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buf, pagesize=A4,
-            leftMargin=2.2*cm, rightMargin=2.2*cm,
-            topMargin=2*cm,    bottomMargin=2*cm,
-        )
+        # ── Page layout with header/footer on every page ──────────
+        PAGE_W, PAGE_H = A4
+        ML  = 2.2*cm
+        MR  = 2.2*cm
+        MT  = 2.5*cm
+        MB  = 2.0*cm
+        CONTENT_W = PAGE_W - ML - MR
 
         NAVY  = colors.HexColor("#0f172a")
         BLUE  = colors.HexColor("#2563eb")
@@ -280,47 +284,200 @@ def generate_pdf(
         GREEN = colors.HexColor("#16a34a")
         AMBER = colors.HexColor("#d97706")
         RED   = colors.HexColor("#dc2626")
+        LBLUE = colors.HexColor("#eff6ff")
 
         grade_color = {
-            "A": GREEN,
-            "B": colors.HexColor("#22c55e"),
-            "C": AMBER,
-            "D": colors.HexColor("#ea580c"),
-            "F": RED,
+            "A": GREEN, "B": colors.HexColor("#22c55e"),
+            "C": AMBER,  "D": colors.HexColor("#ea580c"), "F": RED,
         }
 
-        s_title  = ParagraphStyle("T",  fontSize=24, fontName="Helvetica-Bold",
-                                   textColor=NAVY, spaceAfter=4)
-        s_sub    = ParagraphStyle("S",  fontSize=11, fontName="Helvetica",
-                                   textColor=MGRAY, spaceAfter=4)
-        s_h1     = ParagraphStyle("H1", fontSize=15, fontName="Helvetica-Bold",
-                                   textColor=NAVY, spaceBefore=16, spaceAfter=5)
-        s_h2     = ParagraphStyle("H2", fontSize=11, fontName="Helvetica-Bold",
-                                   textColor=BLUE, spaceBefore=10, spaceAfter=4)
-        s_body   = ParagraphStyle("BD", fontSize=9.5, fontName="Helvetica",
-                                   leading=15, spaceAfter=6,
+        # ── Styles ────────────────────────────────────────────────
+        s_title  = ParagraphStyle("TT", fontSize=22, fontName="Helvetica-Bold",
+                                   textColor=NAVY, spaceAfter=6, leading=26)
+        s_sub    = ParagraphStyle("SB", fontSize=10, fontName="Helvetica",
+                                   textColor=MGRAY, spaceAfter=6)
+        s_h1     = ParagraphStyle("H1", fontSize=14, fontName="Helvetica-Bold",
+                                   textColor=NAVY, spaceBefore=14, spaceAfter=5,
+                                   borderPad=0)
+        s_h2     = ParagraphStyle("H2", fontSize=10, fontName="Helvetica-Bold",
+                                   textColor=BLUE, spaceBefore=8, spaceAfter=4)
+        s_body   = ParagraphStyle("BD", fontSize=9, fontName="Helvetica",
+                                   leading=14, spaceAfter=5,
                                    textColor=colors.HexColor("#334155"))
-        s_code   = ParagraphStyle("CD", fontSize=8, fontName="Courier",
-                                   leading=12, spaceAfter=4,
-                                   textColor=colors.HexColor("#1e40af"),
-                                   backColor=colors.HexColor("#f0f4ff"))
-        s_cap    = ParagraphStyle("CA", fontSize=7.5, fontName="Helvetica-Oblique",
+        s_cap    = ParagraphStyle("CA", fontSize=7, fontName="Helvetica-Oblique",
                                    textColor=MGRAY, spaceAfter=2)
+        s_grade  = ParagraphStyle("GR", fontSize=32, fontName="Helvetica-Bold",
+                                   textColor=NAVY, spaceAfter=0, leading=36)
 
-        def tbl(data, widths, hdr_bg=NAVY):
-            t = Table(data, colWidths=widths)
+        # ── Table builder — wraps long text properly ──────────────
+        def tbl(data, widths, hdr_bg=NAVY, word_wrap=True):
+            # Convert all cells to Paragraph for word-wrap
+            styled_data = []
+            for r_i, row in enumerate(data):
+                styled_row = []
+                for c_i, cell in enumerate(row):
+                    if r_i == 0:
+                        p = Paragraph(str(cell), ParagraphStyle(
+                            "TH", fontSize=8, fontName="Helvetica-Bold",
+                            textColor=colors.white, leading=10,
+                        ))
+                    else:
+                        p = Paragraph(str(cell), ParagraphStyle(
+                            "TD", fontSize=8, fontName="Helvetica",
+                            textColor=colors.HexColor("#1e293b"), leading=11,
+                        ))
+                    styled_row.append(p)
+                styled_data.append(styled_row)
+
+            t = Table(styled_data, colWidths=widths, repeatRows=1)
             t.setStyle(TableStyle([
                 ("BACKGROUND",     (0,0), (-1,0), hdr_bg),
-                ("TEXTCOLOR",      (0,0), (-1,0), colors.white),
-                ("FONTNAME",       (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTSIZE",       (0,0), (-1,-1), 8.5),
                 ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, LGRAY]),
-                ("GRID",           (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
-                ("PADDING",        (0,0), (-1,-1), 6),
-                ("VALIGN",         (0,0), (-1,-1), "MIDDLE"),
+                ("GRID",           (0,0), (-1,-1), 0.3, colors.HexColor("#cbd5e1")),
+                ("TOPPADDING",     (0,0), (-1,-1), 5),
+                ("BOTTOMPADDING",  (0,0), (-1,-1), 5),
+                ("LEFTPADDING",    (0,0), (-1,-1), 6),
+                ("RIGHTPADDING",   (0,0), (-1,-1), 6),
+                ("VALIGN",         (0,0), (-1,-1), "TOP"),
             ]))
             return t
 
+        # ── Page number footer callback ───────────────────────────
+        buf = io.BytesIO()
+
+        def on_page(canvas, doc):
+            canvas.saveState()
+            # Footer line
+            canvas.setStrokeColor(colors.HexColor("#e2e8f0"))
+            canvas.setLineWidth(0.5)
+            canvas.line(ML, MB - 0.3*cm, PAGE_W - MR, MB - 0.3*cm)
+            # Footer text left
+            canvas.setFont("Helvetica", 7)
+            canvas.setFillColor(MGRAY)
+            canvas.drawString(ML, MB - 0.6*cm, "AutoML Debugger v4.0  |  ML Dataset Audit Report")
+            # Page number right
+            page_num = f"Page {doc.page}"
+            canvas.drawRightString(PAGE_W - MR, MB - 0.6*cm, page_num)
+            # Skip header on page 1 (cover)
+            if doc.page > 1:
+                canvas.setStrokeColor(colors.HexColor("#e2e8f0"))
+                canvas.line(ML, PAGE_H - MT + 0.3*cm, PAGE_W - MR, PAGE_H - MT + 0.3*cm)
+                canvas.setFont("Helvetica", 7)
+                canvas.setFillColor(MGRAY)
+                canvas.drawString(ML, PAGE_H - MT + 0.5*cm, "AutoML Debugger")
+                canvas.setFont("Helvetica-Bold", 7)
+                canvas.setFillColor(BLUE)
+                canvas.drawRightString(PAGE_W - MR, PAGE_H - MT + 0.5*cm, "CONFIDENTIAL")
+            canvas.restoreState()
+
+        doc = SimpleDocTemplate(
+            buf, pagesize=A4,
+            leftMargin=ML, rightMargin=MR,
+            topMargin=MT, bottomMargin=MB + 0.8*cm,
+            onFirstPage=on_page, onLaterPages=on_page,
+        )
+
+        story = []
+        grade   = scorecard.get("overall_grade", "?")
+        gc      = grade_color.get(grade, NAVY)
+        gc_hex  = gc.hexval()[2:]
+        now_str = datetime.now().strftime("%B %d, %Y  |  %H:%M")
+
+        # ── COVER PAGE ────────────────────────────────────────────
+        story.append(Spacer(1, 1.5*cm))
+
+        # Blue accent bar at top
+        story.append(HRFlowable(width="100%", thickness=4, color=BLUE,
+                                 spaceAfter=14, lineCap="round"))
+
+        story.append(Paragraph("AutoML Debugger", s_sub))
+        # Use safe ASCII title — no dashes that ReportLab may render wrong
+        story.append(Paragraph("ML Dataset Audit Report", s_title))
+        story.append(Spacer(1, 0.3*cm))
+
+        # Metadata grid — 2 columns
+        meta_data = [
+            ["Target Column", target_column,       "Task Type",     task_type.capitalize()],
+            ["Dataset Size",  f"{profile.get('rows',0):,} rows x {profile.get('columns',0)} cols",
+             "Generated",     now_str],
+            ["Overall Grade", grade,                "Score",         f"{scorecard.get('overall_score',0)}/100"],
+            ["Health Score",  f"{health.get('total',0)}/100",
+             "Verdict",       scorecard.get("overall_verdict","").replace("\u2014","-")],
+        ]
+        meta_style = ParagraphStyle("MS", fontSize=8.5, fontName="Helvetica",
+                                     textColor=colors.HexColor("#1e293b"), leading=12)
+        meta_label = ParagraphStyle("ML2", fontSize=8.5, fontName="Helvetica-Bold",
+                                     textColor=NAVY, leading=12)
+        styled_meta = []
+        for row in meta_data:
+            styled_meta.append([
+                Paragraph(row[0], meta_label), Paragraph(row[1], meta_style),
+                Paragraph(row[2], meta_label), Paragraph(row[3], meta_style),
+            ])
+        mt = Table(styled_meta, colWidths=[4*cm, 5.2*cm, 3.5*cm, 4.3*cm])
+        mt.setStyle(TableStyle([
+            ("ROWBACKGROUNDS", (0,0), (-1,-1), [colors.white, LGRAY]),
+            ("GRID",           (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
+            ("TOPPADDING",     (0,0), (-1,-1), 7),
+            ("BOTTOMPADDING",  (0,0), (-1,-1), 7),
+            ("LEFTPADDING",    (0,0), (-1,-1), 8),
+            ("RIGHTPADDING",   (0,0), (-1,-1), 8),
+            ("VALIGN",         (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(mt)
+        story.append(Spacer(1, 0.6*cm))
+
+        # Grade box
+        verdict_text = scorecard.get("overall_verdict","").replace("\u2014","-")
+        grade_box_data = [[
+            Paragraph(grade, ParagraphStyle("GB", fontSize=36, fontName="Helvetica-Bold",
+                                             textColor=gc, leading=40)),
+            Paragraph(
+                f'<b style="font-size:13">Data Quality Grade: {grade}</b><br/>'
+                f'<font size="10" color="#{gc_hex}">{verdict_text}</font><br/>'
+                f'<font size="8" color="#94a3b8">{scorecard.get("benchmark","")}</font>',
+                ParagraphStyle("GBT", fontSize=11, fontName="Helvetica",
+                                textColor=NAVY, leading=16),
+            ),
+        ]]
+        grade_tbl = Table(grade_box_data, colWidths=[2*cm, CONTENT_W - 2*cm])
+        grade_tbl.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), LBLUE),
+            ("BOX",           (0,0), (-1,-1), 1, gc),
+            ("TOPPADDING",    (0,0), (-1,-1), 12),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+            ("LEFTPADDING",   (0,0), (-1,-1), 14),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 14),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(grade_tbl)
+        story.append(PageBreak())
+
+        # ── PAGE 2: SCORECARD ─────────────────────────────────────
+        story.append(Paragraph("Data Quality Scorecard", s_h1))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                 color=colors.HexColor("#e2e8f0"), spaceAfter=8))
+        sc_data = [["Section", "Score", "Grade", "Impact", "Details"]]
+        for sec in scorecard.get("sections", []):
+            sc_data.append([
+                sec["name"],
+                f"{sec['score']}/100",
+                sec["grade"],
+                sec.get("impact",""),
+                sec.get("details",""),
+            ])
+        story.append(tbl(sc_data, [4.5*cm, 2.2*cm, 1.5*cm, 2.3*cm, CONTENT_W-10.5*cm]))
+        story.append(Spacer(1, 0.5*cm))
+
+        story.append(Paragraph("Health Score Breakdown", s_h2))
+        hd = [["Dimension", "Score", "Max", "Status Notes"]]
+        for dim, dv in health.get("dimensions", {}).items():
+            hd.append([dim, str(dv["score"]), str(dv["max"]), dv.get("reason","")])
+        hd.append(["TOTAL", str(health.get("total",0)), "100", health.get("verdict","")])
+        story.append(tbl(hd, [5*cm, 2*cm, 2*cm, CONTENT_W-9*cm]))
+        story.append(PageBreak())
+
+        # ── GROQ REPORT SECTIONS ──────────────────────────────────
         SECTION_TITLES = {
             "executive_summary":        "Executive Summary",
             "dataset_quality_analysis": "Dataset Quality Analysis",
@@ -329,210 +486,152 @@ def generate_pdf(
             "recommended_next_steps":   "Recommended Next Steps",
             "model_recommendations":    "Model Recommendations",
         }
-
         SECTION_AUDIENCE = {
-            "executive_summary":        "For: Management",
-            "dataset_quality_analysis": "For: ML Engineers",
-            "risk_assessment":          "For: Compliance",
-            "feature_analysis":         "For: Data Scientists",
-            "recommended_next_steps":   "For: Project Managers",
-            "model_recommendations":    "For: Engineering Team",
+            "executive_summary":        "Audience: Management",
+            "dataset_quality_analysis": "Audience: ML Engineers",
+            "risk_assessment":          "Audience: Compliance",
+            "feature_analysis":         "Audience: Data Scientists",
+            "recommended_next_steps":   "Audience: Project Managers",
+            "model_recommendations":    "Audience: Engineering Team",
         }
 
-        story = []
-
-        # ── COVER PAGE ────────────────────────────────────────────
-        story.append(Spacer(1, 1.2*cm))
-        story.append(Paragraph("AutoML Debugger", s_sub))
-        story.append(Paragraph("ML Dataset Audit Report", s_title))
-        story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=14))
-
-        grade  = scorecard.get("overall_grade", "?")
-        gc     = grade_color.get(grade, NAVY)
-        now_str = datetime.now().strftime("%B %d, %Y  %H:%M")
-
-        meta = [
-            ["Target Column",  target_column,
-             "Task Type",      task_type.capitalize()],
-            ["Dataset Size",   f"{profile.get('rows',0):,} rows x {profile.get('columns',0)} cols",
-             "Generated",      now_str],
-            ["Overall Grade",  grade,
-             "Score",          f"{scorecard.get('overall_score',0)}/100"],
-            ["Health Score",   f"{health.get('total',0)}/100",
-             "Verdict",        scorecard.get("overall_verdict","")],
-        ]
-        mt = Table(meta, colWidths=[4*cm, 5*cm, 3.5*cm, 4.5*cm])
-        mt.setStyle(TableStyle([
-            ("FONTSIZE",       (0,0), (-1,-1), 8.5),
-            ("FONTNAME",       (0,0), (0,-1), "Helvetica-Bold"),
-            ("FONTNAME",       (2,0), (2,-1), "Helvetica-Bold"),
-            ("TEXTCOLOR",      (0,0), (0,-1), NAVY),
-            ("TEXTCOLOR",      (2,0), (2,-1), NAVY),
-            ("ROWBACKGROUNDS", (0,0), (-1,-1), [colors.white, LGRAY]),
-            ("GRID",           (0,0), (-1,-1), 0.3, colors.HexColor("#e2e8f0")),
-            ("PADDING",        (0,0), (-1,-1), 7),
-        ]))
-        story.append(mt)
-        story.append(Spacer(1, 0.5*cm))
-
-        gc_hex = gc.hexval()[2:]
-        story.append(Paragraph(
-            f'<font size="13" color="#{gc_hex}"><b>Data Quality Grade: {grade}</b></font>',
-            s_body,
-        ))
-        verdict_clean = scorecard.get("overall_verdict","").replace("\u2014", "-")
-        story.append(Paragraph(
-            f'<font size="11" color="#{gc_hex}">{verdict_clean}</font>',
-            s_body,
-        ))
-        story.append(Paragraph(scorecard.get("benchmark",""), s_cap))
-        story.append(Spacer(1, 0.6*cm))
-        story.append(PageBreak())
-
-        # ── SCORECARD ─────────────────────────────────────────────
-        story.append(Paragraph("Data Quality Scorecard", s_h1))
-        sc_data = [["Section", "Score", "Grade", "Impact", "Details"]]
-        for sec in scorecard.get("sections", []):
-            sc_data.append([
-                sec["name"],
-                f"{sec['score']}/100",
-                sec["grade"],
-                sec.get("impact",""),
-                sec.get("details","")[:55],
-            ])
-        story.append(tbl(sc_data, [4.5*cm, 2*cm, 1.5*cm, 2*cm, 7*cm]))
-        story.append(Spacer(1, 0.4*cm))
-
-        # Health breakdown
-        story.append(Paragraph("Health Score Breakdown", s_h2))
-        hd = [["Dimension", "Score", "Max", "Notes"]]
-        for dim, dv in health.get("dimensions", {}).items():
-            hd.append([dim, str(dv["score"]), str(dv["max"]), dv.get("reason","")[:60]])
-        hd.append(["TOTAL", str(health.get("total",0)), "100", health.get("verdict","")])
-        story.append(tbl(hd, [5*cm, 2*cm, 2*cm, 8*cm]))
-        story.append(PageBreak())
-
-        # ── GROQ REPORT SECTIONS ──────────────────────────────────
         for key_name, title in SECTION_TITLES.items():
             text = report_sections.get(key_name, "")
             if not text:
                 continue
-            story.append(Paragraph(title, s_h1))
+            # Section number badge
+            sec_num = list(SECTION_TITLES.keys()).index(key_name) + 1
+            story.append(Paragraph(f"{sec_num}.  {title}", s_h1))
             story.append(Paragraph(SECTION_AUDIENCE[key_name], s_cap))
             story.append(HRFlowable(width="100%", thickness=0.5,
                                      color=colors.HexColor("#e2e8f0"), spaceAfter=8))
             story.append(Paragraph(text, s_body))
-            story.append(Spacer(1, 0.2*cm))
+            story.append(Spacer(1, 0.3*cm))
 
         story.append(PageBreak())
 
-        # ── DATA TABLES ───────────────────────────────────────────
-        story.append(Paragraph("Dataset Profile", s_h1))
+        # ── APPENDIX: DATA TABLES ─────────────────────────────────
+        story.append(Paragraph("Appendix — Data Tables", s_h1))
+        story.append(HRFlowable(width="100%", thickness=0.5,
+                                 color=colors.HexColor("#e2e8f0"), spaceAfter=10))
+
+        # A1 — Dataset Profile
+        story.append(Paragraph("A1. Dataset Profile", s_h2))
         prof = [
             ["Metric", "Value", "Metric", "Value"],
-            ["Rows",             f"{profile.get('rows',0):,}",
+            ["Rows",              f"{profile.get('rows',0):,}",
              "Numeric Features",  str(profile.get('numeric_features',0))],
-            ["Columns",          str(profile.get('columns',0)),
-             "Categorical",       str(profile.get('categorical_features',0))],
-            ["Missing Values",   f"{profile.get('missing_pct',0)}%",
-             "Duplicates",        str(profile.get('duplicate_rows',0))],
+            ["Columns",           str(profile.get('columns',0)),
+             "Categorical Features", str(profile.get('categorical_features',0))],
+            ["Missing Values",    f"{profile.get('missing_pct',0)}%",
+             "Duplicate Rows",    str(profile.get('duplicate_rows',0))],
             ["Constant Features", str(len(profile.get('constant_features',[]))),
-             "High-Card Cols",    str(len(profile.get('high_cardinality_cols',[])))],
+             "High-Cardinality Cols", str(len(profile.get('high_cardinality_cols',[])))],
             ["Leakage Candidates", str(len(leakage.get('leakage_candidates',[]))),
              "Redundant Pairs",   str(len(redundancy.get('redundant_pairs',[])))],
         ]
-        story.append(tbl(prof, [4.5*cm, 4*cm, 4.5*cm, 4*cm]))
+        half = CONTENT_W / 2
+        story.append(tbl(prof, [half*0.42, half*0.58, half*0.42, half*0.58]))
         story.append(Spacer(1, 0.4*cm))
 
-        # Missing pattern
-        story.append(Paragraph("Missing Value Pattern", s_h2))
+        # A2 — Missing pattern
+        story.append(Paragraph("A2. Missing Value Pattern", s_h2))
         mp_d = [
-            ["Pattern", "Total Missing %", "Recommendation"],
+            ["Pattern", "Total Missing %", "Imputation Recommendation"],
             [missing_pattern.get("pattern","NONE"),
              f"{missing_pattern.get('total_missing_pct',0)}%",
-             missing_pattern.get("recommendation","")[:80]],
+             missing_pattern.get("recommendation","")],
         ]
-        story.append(tbl(mp_d, [3*cm, 4*cm, 10*cm]))
+        story.append(tbl(mp_d, [2.5*cm, 3*cm, CONTENT_W-5.5*cm]))
         story.append(Spacer(1, 0.4*cm))
 
-        # Redundant pairs
+        # A3 — Redundant pairs
         red_pairs = redundancy.get("redundant_pairs", [])
         if red_pairs:
-            story.append(Paragraph("Top Redundant Feature Pairs", s_h2))
-            rp = [["Feature 1","Feature 2","Correlation","Severity"]]
-            for p in red_pairs[:8]:
-                rp.append([p["feature_1"], p["feature_2"],
-                            str(p["correlation"]), p["severity"]])
-            story.append(tbl(rp, [4.5*cm, 4.5*cm, 3*cm, 5*cm]))
+            story.append(Paragraph("A3. Top Redundant Feature Pairs", s_h2))
+            rp = [["Feature 1","Feature 2","Correlation","Severity","Action"]]
+            for p in red_pairs[:10]:
+                rp.append([
+                    p["feature_1"], p["feature_2"],
+                    str(p["correlation"]), p["severity"],
+                    p.get("recommendation","")[:40],
+                ])
+            story.append(tbl(rp, [3.5*cm, 3.5*cm, 2.5*cm, 2.5*cm, CONTENT_W-12*cm]))
             story.append(Spacer(1, 0.4*cm))
 
-        # Leakage probability
+        # A4 — Leakage probability
         if leakage_prob and leakage_prob.get("features"):
-            story.append(Paragraph("Leakage Probability Scores (Top 10)", s_h2))
-            lp_d = [["Feature","MI Score","Correlation","Leakage Prob","Risk"]]
-            for col, v in list(leakage_prob["features"].items())[:10]:
+            story.append(Paragraph("A4. Leakage Probability Scores", s_h2))
+            lp_d = [["Feature","MI Score","Correlation","Leakage Probability","Risk Level"]]
+            for col, v in list(leakage_prob["features"].items())[:12]:
                 lp_d.append([col, str(v["mi_score"]), str(v["correlation"]),
                               str(v["leakage_prob"]), v["risk_level"]])
-            story.append(tbl(lp_d, [4*cm, 2.5*cm, 3*cm, 3*cm, 4.5*cm]))
+            story.append(tbl(lp_d, [4*cm, 2.2*cm, 2.8*cm, 3.5*cm, CONTENT_W-12.5*cm]))
             story.append(Spacer(1, 0.4*cm))
 
-        # Drift simulation
+        # A5 — Drift simulation
         if drift_sim and drift_sim.get("available"):
-            story.append(Paragraph("Data Drift Simulation (First vs Second Half)", s_h2))
-            dr_top = drift_sim.get("drift_results", [])[:8]
+            story.append(Paragraph("A5. Data Drift Simulation (First vs Second Half)", s_h2))
+            story.append(Paragraph(drift_sim.get("verdict",""), s_body))
+            dr_top = drift_sim.get("drift_results", [])[:10]
             if dr_top:
-                dr_d = [["Feature","KS Stat","Drifted","Severity","Mean Shift %"]]
+                dr_d = [["Feature","KS Stat","p-value","Drifted?","Severity","Mean Shift %"]]
                 for r in dr_top:
-                    dr_d.append([r["feature"], str(r["ks_stat"]),
-                                  "YES" if r["drifted"] else "NO",
-                                  r["severity"], f"{r['mean_shift']}%"])
-                story.append(tbl(dr_d, [4*cm, 2.5*cm, 2*cm, 3*cm, 3*cm]))
+                    dr_d.append([
+                        r["feature"], str(r["ks_stat"]), str(r["p_value"]),
+                        "YES" if r["drifted"] else "NO",
+                        r["severity"], f"{r['mean_shift']}%",
+                    ])
+                story.append(tbl(dr_d, [3.5*cm, 2*cm, 2*cm, 2*cm, 2.5*cm, CONTENT_W-12*cm]))
                 story.append(Spacer(1, 0.4*cm))
 
-        # Feature Engineering Roadmap
+        # A6 — Feature Engineering Roadmap
         if fe_roadmap:
-            story.append(Paragraph("Feature Engineering Roadmap", s_h2))
-            for phase_key, phase_label in [
-                ("phase1","Phase 1 - Quick Wins (~30 min)"),
-                ("phase2","Phase 2 - Moderate Effort (2-4 hours)"),
-                ("phase3","Phase 3 - Advanced (1+ days)"),
+            story.append(Paragraph("A6. Feature Engineering Roadmap", s_h2))
+            for phase_key, phase_label, phase_color in [
+                ("phase1", "Phase 1 — Quick Wins (~30 min)", GREEN),
+                ("phase2", "Phase 2 — Moderate Effort (2-4 hours)", AMBER),
+                ("phase3", "Phase 3 — Advanced (1+ days)", BLUE),
             ]:
                 items = fe_roadmap.get(phase_key, [])
                 if not items:
                     continue
-                story.append(Paragraph(phase_label, s_cap))
-                ph_d = [["Action","Columns","Expected Impact","Code"]]
+                story.append(Paragraph(phase_label, ParagraphStyle(
+                    "PL", fontSize=8.5, fontName="Helvetica-Bold",
+                    textColor=phase_color, spaceBefore=8, spaceAfter=4,
+                )))
+                ph_d = [["Action","Target Columns","Expected Impact","Code Example"]]
                 for item in items:
-                    cols_str = str(item.get("columns",""))[:30]
-                    code_str = item.get("code","").split("\n")[0][:40]
+                    cols_str = ", ".join(str(c) for c in item.get("columns",[]))[:35] if item.get("columns") else "Multiple"
+                    code_str = item.get("code","").split("\n")[0][:50]
                     ph_d.append([
-                        item.get("action","")[:40],
+                        item.get("action",""),
                         cols_str,
-                        item.get("expected_impact","")[:40],
+                        item.get("expected_impact",""),
                         code_str,
                     ])
-                story.append(tbl(ph_d, [4.5*cm, 3.5*cm, 4*cm, 5*cm]))
+                story.append(tbl(ph_d, [4.5*cm, 3*cm, 4*cm, CONTENT_W-11.5*cm]))
                 story.append(Spacer(1, 0.2*cm))
-            story.append(Spacer(1, 0.2*cm))
+            story.append(Spacer(1, 0.3*cm))
 
-        # Sample size checks
+        # A7 — Sample size
         checks = sample_check.get("checks", [])
         if checks:
-            story.append(Paragraph("Sample Size Adequacy", s_h2))
+            story.append(Paragraph("A7. Sample Size Adequacy", s_h2))
             ch = [["Rule","Needed","Have","Status"]]
             for c in checks:
                 ch.append([c["rule"], str(c["needed"]), str(c["have"]),
-                            "Pass" if c["pass"] else "FAIL"])
-            story.append(tbl(ch, [7*cm, 3*cm, 3*cm, 4*cm]))
+                            "PASS" if c["pass"] else "FAIL"])
+            story.append(tbl(ch, [8*cm, 2.5*cm, 2.5*cm, CONTENT_W-13*cm]))
             story.append(Spacer(1, 0.4*cm))
 
-        # Automated fixes
+        # A8 — Automated fixes
         if fix_actions:
-            story.append(Paragraph("Automated Fixes Applied to Cleaned Dataset", s_h2))
-            fx = [["#","Action"]]
+            story.append(Paragraph("A8. Automated Fixes Applied to Cleaned Dataset", s_h2))
+            fx = [["#","Action Applied"]]
             for i, a in enumerate(fix_actions, 1):
                 fx.append([str(i), a])
-            story.append(tbl(fx, [1.5*cm, 15.5*cm]))
+            story.append(tbl(fx, [1.2*cm, CONTENT_W-1.2*cm]))
 
         doc.build(story)
         return buf.getvalue()
@@ -542,5 +641,4 @@ def generate_pdf(
             f"AUTOML DEBUGGER AUDIT REPORT\n"
             f"Generated: {datetime.now()}\n"
             f"Grade: {scorecard.get('overall_grade','?')}\n"
-            f"Score: {scorecard.get('overall_score',0)}/100\n"
         ).encode()
