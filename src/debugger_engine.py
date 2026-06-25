@@ -1294,3 +1294,364 @@ Rules: Be specific to this dataset's actual columns. No generic suggestions. No 
     })
 
     return framings[:3]
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 3 — FEATURE 13
+# FEATURE ENGINEERING ROADMAP (3 phases with effort + impact)
+# ─────────────────────────────────────────────────────────────────
+
+def build_feature_engineering_roadmap(
+    df:            pd.DataFrame,
+    target_column: str,
+    task_type:     str,
+    profile:       dict,
+    distributions: dict,
+    redundancy:    dict,
+    type_inference: dict,
+    leakage:       dict,
+) -> dict[str, Any]:
+    """
+    Generates a 3-phase feature engineering roadmap:
+      Phase 1 — Quick Wins       (< 30 min, low effort)
+      Phase 2 — Moderate Effort  (2-4 hours)
+      Phase 3 — Advanced         (1+ days)
+
+    Each suggestion has: action, column, reason, effort, expected_impact, code_snippet
+    """
+    numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                    if c != target_column]
+    cat_cols     = [c for c in df.select_dtypes(exclude=[np.number]).columns
+                    if c != target_column]
+
+    phase1: list[dict] = []  # Quick wins
+    phase2: list[dict] = []  # Moderate
+    phase3: list[dict] = []  # Advanced
+
+    # ── PHASE 1 — Quick Wins ─────────────────────────────────────
+
+    # 1a. Drop constant columns
+    const = profile.get("constant_features", [])
+    if const:
+        phase1.append({
+            "action":          f"Drop {len(const)} constant column(s)",
+            "columns":         const,
+            "reason":          "Zero variance — no information for any model",
+            "effort":          "5 min",
+            "expected_impact": "Reduces noise, speeds training",
+            "code":            f"df.drop(columns={const}, inplace=True)",
+        })
+
+    # 1b. Drop redundant features (high correlation pairs)
+    drop_sug = redundancy.get("drop_suggestions", [])
+    if drop_sug:
+        phase1.append({
+            "action":          f"Drop {len(drop_sug)} redundant feature(s)",
+            "columns":         drop_sug[:5],
+            "reason":          "Correlation > 0.95 with another feature — pure duplication",
+            "effort":          "5 min",
+            "expected_impact":  "Reduces multicollinearity, improves linear model stability",
+            "code":            f"df.drop(columns={drop_sug[:3]}, inplace=True)",
+        })
+
+    # 1c. Log transform skewed features
+    skewed = [col for col, d in distributions.items()
+              if abs(d.get("skewness", 0)) > 1.5 and df[col].min() > 0]
+    if skewed:
+        phase1.append({
+            "action":          f"Log-transform {len(skewed)} skewed feature(s)",
+            "columns":         skewed[:5],
+            "reason":          "High skewness hurts linear models and can slow tree convergence",
+            "effort":          "10 min",
+            "expected_impact": "Improves Ridge/Logistic by 5-15%, normalises distributions",
+            "code":            f"import numpy as np\nfor col in {skewed[:3]}:\n    df[col + '_log'] = np.log1p(df[col])",
+        })
+
+    # 1d. Binary encode low-cardinality categoricals
+    low_card_cats = [c for c in cat_cols if 2 <= df[c].nunique() <= 5
+                     and c not in leakage.get("leakage_candidates", [])]
+    if low_card_cats:
+        phase1.append({
+            "action":          f"One-hot encode {len(low_card_cats)} low-cardinality categorical(s)",
+            "columns":         low_card_cats[:4],
+            "reason":          "Low cardinality categoricals (2-5 values) encode cleanly with OHE",
+            "effort":          "10 min",
+            "expected_impact": "Makes categorical features usable by all model types",
+            "code":            f"df = pd.get_dummies(df, columns={low_card_cats[:3]}, drop_first=True)",
+        })
+
+    # ── PHASE 2 — Moderate Effort ────────────────────────────────
+
+    # 2a. Target encoding for high-cardinality categoricals
+    high_card = profile.get("high_cardinality_cols", [])
+    if high_card:
+        phase2.append({
+            "action":          f"Target-encode {len(high_card)} high-cardinality column(s)",
+            "columns":         high_card[:3],
+            "reason":          f"OHE on {high_card[:2]} would create too many sparse columns",
+            "effort":          "30 min",
+            "expected_impact": "Better signal than OHE for high-cardinality features",
+            "code":            (
+                f"# Use sklearn TargetEncoder or manual:\n"
+                f"target_means = df.groupby('{high_card[0]}')['{target_column}'].mean()\n"
+                f"df['{high_card[0]}_encoded'] = df['{high_card[0]}'].map(target_means)"
+                if high_card else ""
+            ),
+        })
+
+    # 2b. Interaction features between top correlated pairs
+    top_corr = list(profile.get("top_correlations", {}).keys())[:4]
+    if len(top_corr) >= 2:
+        a, b = top_corr[0], top_corr[1]
+        phase2.append({
+            "action":          f"Create interaction feature: {a} × {b}",
+            "columns":         [a, b],
+            "reason":          "Top-2 correlated features — their product may capture multiplicative relationships",
+            "effort":          "15 min",
+            "expected_impact": "Can improve tree models 2-5% by capturing feature interactions",
+            "code":            f"df['{a}_x_{b}'] = df['{a}'] * df['{b}']",
+        })
+
+    # 2c. Datetime feature decomposition
+    date_cols = [inf["column"] for inf in type_inference.get("inferences", [])
+                 if inf.get("inferred") == "Date / Datetime"]
+    if date_cols:
+        col = date_cols[0]
+        phase2.append({
+            "action":          f"Decompose datetime column '{col}'",
+            "columns":         [col],
+            "reason":          "Raw datetime strings are useless — extract temporal features",
+            "effort":          "20 min",
+            "expected_impact": "Captures seasonality, trends, and cyclical patterns",
+            "code":            (
+                f"df['{col}'] = pd.to_datetime(df['{col}'])\n"
+                f"df['{col}_year']      = df['{col}'].dt.year\n"
+                f"df['{col}_month']     = df['{col}'].dt.month\n"
+                f"df['{col}_dayofweek'] = df['{col}'].dt.dayofweek\n"
+                f"df['{col}_quarter']   = df['{col}'].dt.quarter"
+            ),
+        })
+
+    # 2d. Bin continuous features
+    if len(numeric_cols) >= 3:
+        bin_col = top_corr[0] if top_corr else numeric_cols[0]
+        phase2.append({
+            "action":          f"Quantile-bin '{bin_col}' into 5 buckets",
+            "columns":         [bin_col],
+            "reason":          "Binning can capture non-linear relationships in high-variance features",
+            "effort":          "15 min",
+            "expected_impact": "Helps linear models capture non-linear patterns",
+            "code":            f"df['{bin_col}_bin'] = pd.qcut(df['{bin_col}'], q=5, labels=False, duplicates='drop')",
+        })
+
+    # ── PHASE 3 — Advanced ───────────────────────────────────────
+
+    # 3a. Polynomial features for small feature sets
+    if len(numeric_cols) <= 10:
+        phase3.append({
+            "action":          "Add degree-2 polynomial features",
+            "columns":         numeric_cols[:5],
+            "reason":          f"With only {len(numeric_cols)} numeric features, polynomial expansion adds non-linear signal cheaply",
+            "effort":          "1 hour (test for overfitting)",
+            "expected_impact": "Can improve R² by 10-20% for linear models on non-linear data",
+            "code":            (
+                "from sklearn.preprocessing import PolynomialFeatures\n"
+                "poly = PolynomialFeatures(degree=2, include_bias=False)\n"
+                "X_poly = poly.fit_transform(df[numeric_cols])\n"
+                "# Use X_poly instead of df[numeric_cols] for training"
+            ),
+        })
+
+    # 3b. Lag features (time-series)
+    from src.debugger_engine import detect_timeseries as _dts  # avoid circular
+    phase3.append({
+        "action":          f"Create lag features for '{target_column}'",
+        "columns":         [target_column],
+        "reason":          "Past values of the target are often the strongest predictor of future values",
+        "effort":          "2 hours (choose lag window carefully)",
+        "expected_impact": "Can dramatically improve time-series forecasting accuracy",
+        "code":            (
+            f"for lag in [1, 3, 7, 14]:\n"
+            f"    df['{target_column}_lag_{{lag}}'] = df['{target_column}'].shift(lag)\n"
+            f"df.dropna(inplace=True)  # remove NaN rows created by shifting"
+        ),
+    })
+
+    # 3c. External data suggestion
+    phase3.append({
+        "action":          "Enrich with external data sources",
+        "columns":         [],
+        "reason":          "Internal data has a ceiling — external signals often unlock the next level of accuracy",
+        "effort":          "1-2 days",
+        "expected_impact": "Highly variable — can improve accuracy by 20-40% if relevant external data exists",
+        "code":            (
+            "# Examples of external enrichment:\n"
+            "# - Economic indicators (FRED API)\n"
+            "# - Weather data (OpenWeatherMap)\n"
+            "# - Social signals (Twitter/Reddit sentiment)\n"
+            "# - Geographic data (census, geo-coordinates)"
+        ),
+    })
+
+    total_quick_impact = f"{len(phase1)} quick fixes"
+    summary = (
+        f"Phase 1 ({len(phase1)} actions, ~30 min): Drop noise, encode basics, transform distributions. "
+        f"Phase 2 ({len(phase2)} actions, ~2-4 hours): Engineer interactions, handle categoricals, decompose dates. "
+        f"Phase 3 ({len(phase3)} actions, 1+ days): Polynomials, lag features, external enrichment."
+    )
+
+    return {
+        "phase1":   phase1,
+        "phase2":   phase2,
+        "phase3":   phase3,
+        "summary":  summary,
+        "n_total":  len(phase1) + len(phase2) + len(phase3),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# MILESTONE 3 — FEATURE 14
+# DATASET COMPARISON (Two versions — what changed?)
+# ─────────────────────────────────────────────────────────────────
+
+def compare_datasets(
+    df_old: pd.DataFrame,
+    df_new: pd.DataFrame,
+    target_column: str,
+) -> dict[str, Any]:
+    """
+    Compares two versions of a dataset:
+    - Schema changes (columns added/removed/renamed)
+    - Row count changes
+    - Distribution shifts per feature (KS test)
+    - Missing value changes
+    - Duplicate changes
+    - Target distribution change
+
+    Returns a structured comparison report.
+    """
+    report: dict[str, Any] = {}
+
+    # ── Schema changes ───────────────────────
+    cols_old = set(df_old.columns)
+    cols_new = set(df_new.columns)
+    added    = list(cols_new - cols_old)
+    removed  = list(cols_old - cols_new)
+    common   = list(cols_old & cols_new)
+
+    report["schema"] = {
+        "cols_old":   len(cols_old),
+        "cols_new":   len(cols_new),
+        "added":      added,
+        "removed":    removed,
+        "common":     len(common),
+        "changed":    bool(added or removed),
+    }
+
+    # ── Row count ────────────────────────────
+    report["rows"] = {
+        "old":    len(df_old),
+        "new":    len(df_new),
+        "delta":  len(df_new) - len(df_old),
+        "delta_pct": round((len(df_new) - len(df_old)) / max(len(df_old), 1) * 100, 1),
+    }
+
+    # ── Missing value changes ────────────────
+    missing_changes: list[dict] = []
+    for col in common:
+        old_miss = df_old[col].isna().mean() * 100
+        new_miss = df_new[col].isna().mean() * 100
+        delta    = new_miss - old_miss
+        if abs(delta) > 1:
+            missing_changes.append({
+                "column":    col,
+                "old_pct":   round(old_miss, 2),
+                "new_pct":   round(new_miss, 2),
+                "delta":     round(delta, 2),
+                "direction": "⬆️ Increased" if delta > 0 else "⬇️ Decreased",
+            })
+    report["missing_changes"] = sorted(missing_changes, key=lambda x: abs(x["delta"]), reverse=True)
+
+    # ── Duplicate changes ────────────────────
+    report["duplicates"] = {
+        "old": int(df_old.duplicated().sum()),
+        "new": int(df_new.duplicated().sum()),
+    }
+
+    # ── Distribution shifts (KS test) ────────
+    numeric_common = [c for c in common
+                      if pd.api.types.is_numeric_dtype(df_old[c])
+                      and pd.api.types.is_numeric_dtype(df_new[c])]
+
+    distribution_shifts: list[dict] = []
+    for col in numeric_common[:20]:
+        try:
+            s_old = df_old[col].dropna()
+            s_new = df_new[col].dropna()
+            if len(s_old) < 5 or len(s_new) < 5:
+                continue
+            ks_stat, p_val = scipy_stats.ks_2samp(s_old, s_new)
+            mean_old = float(s_old.mean())
+            mean_new = float(s_new.mean())
+            shift    = round(abs(mean_new - mean_old) / (abs(mean_old) + 1e-8) * 100, 1)
+            distribution_shifts.append({
+                "column":     col,
+                "ks_stat":    round(float(ks_stat), 4),
+                "p_value":    round(float(p_val), 4),
+                "shifted":    p_val < 0.05,
+                "mean_old":   round(mean_old, 4),
+                "mean_new":   round(mean_new, 4),
+                "mean_shift": shift,
+                "severity":   "🔴 HIGH" if ks_stat > 0.3 else ("🟡 MEDIUM" if ks_stat > 0.15 else "🟢 LOW"),
+            })
+        except Exception:
+            continue
+
+    distribution_shifts.sort(key=lambda x: x["ks_stat"], reverse=True)
+    n_shifted = sum(1 for d in distribution_shifts if d["shifted"])
+    report["distribution_shifts"] = distribution_shifts
+    report["n_shifted"]           = n_shifted
+
+    # ── Target distribution change ───────────
+    if target_column in common and pd.api.types.is_numeric_dtype(df_old[target_column]):
+        try:
+            t_old = df_old[target_column].dropna()
+            t_new = df_new[target_column].dropna()
+            ks_t, p_t = scipy_stats.ks_2samp(t_old, t_new)
+            report["target_shift"] = {
+                "ks_stat":  round(float(ks_t), 4),
+                "p_value":  round(float(p_t), 4),
+                "shifted":  p_t < 0.05,
+                "mean_old": round(float(t_old.mean()), 4),
+                "mean_new": round(float(t_new.mean()), 4),
+                "severity": "🔴 HIGH" if ks_t > 0.3 else ("🟡 MEDIUM" if ks_t > 0.15 else "🟢 LOW"),
+            }
+        except Exception:
+            report["target_shift"] = None
+    else:
+        report["target_shift"] = None
+
+    # ── Overall verdict ──────────────────────
+    critical_issues = []
+    if report["schema"]["changed"]:
+        critical_issues.append(f"Schema changed — {len(added)} col(s) added, {len(removed)} col(s) removed")
+    if n_shifted > len(numeric_common) * 0.3:
+        critical_issues.append(f"{n_shifted} features show significant distribution shift")
+    if report["target_shift"] and report["target_shift"]["shifted"]:
+        critical_issues.append("Target variable distribution has shifted")
+
+    if not critical_issues:
+        verdict = "🟢 Datasets are similar — safe to retrain on new version"
+        risk    = "LOW"
+    elif len(critical_issues) == 1:
+        verdict = f"🟡 Minor differences detected — review before retraining"
+        risk    = "MEDIUM"
+    else:
+        verdict = f"🔴 Significant changes detected — do NOT assume model will transfer"
+        risk    = "HIGH"
+
+    report["verdict"]         = verdict
+    report["risk"]            = risk
+    report["critical_issues"] = critical_issues
+
+    return report
